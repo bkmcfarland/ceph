@@ -17,6 +17,13 @@ install(TARGETS
   DESTINATION bin)
 endif(WITH_TESTS)
 
+add_custom_target(civetweb_h
+  COMMAND ${CMAKE_COMMAND} -E make_directory
+  "${CMAKE_BINARY_DIR}/src/include/civetweb"
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different
+  "${CMAKE_SOURCE_DIR}/src/civetweb/include/civetweb.h"
+  "${CMAKE_BINARY_DIR}/src/include/civetweb"
+  COMMENT "keep civetweb.h up-to-date")
 
 set(rgw_a_srcs
   rgw_acl.cc
@@ -95,6 +102,8 @@ set(rgw_a_srcs
   rgw_torrent.cc)
 
 add_library(rgw_a STATIC ${rgw_a_srcs})
+
+add_dependencies(rgw_a civetweb_h)
 
 target_include_directories(rgw_a PUBLIC
   "../Beast/include"

@@ -390,25 +390,28 @@ int RocksDBStore::submit_transaction(KeyValueDB::Transaction t)
          << " Rocksdb transaction: " << rocks_txc.seen << dendl;
   }
   utime_t lat = ceph_clock_now(g_ceph_context) - start;
-  utime_t write_memtable_time;
-  utime_t write_delay_time;
-  utime_t write_wal_time;
-  utime_t write_pre_and_post_process_time;
-  write_wal_time.set_from_double(
-      static_cast<double>(rocksdb::perf_context.write_wal_time)/1000000000);
-  write_memtable_time.set_from_double(
-      static_cast<double>(rocksdb::perf_context.write_memtable_time)/1000000000);
-  write_delay_time.set_from_double(
-      static_cast<double>(rocksdb::perf_context.write_delay_time)/1000000000);
-  write_pre_and_post_process_time.set_from_double(
-      static_cast<double>(rocksdb::perf_context.write_pre_and_post_process_time)/1000000000);
+
+  if (g_conf->rocksdb_perf) {
+    utime_t write_memtable_time;
+    utime_t write_delay_time;
+    utime_t write_wal_time;
+    utime_t write_pre_and_post_process_time;
+    write_wal_time.set_from_double(
+	static_cast<double>(rocksdb::perf_context.write_wal_time)/1000000000);
+    write_memtable_time.set_from_double(
+	static_cast<double>(rocksdb::perf_context.write_memtable_time)/1000000000);
+    write_delay_time.set_from_double(
+	static_cast<double>(rocksdb::perf_context.write_delay_time)/1000000000);
+    write_pre_and_post_process_time.set_from_double(
+	static_cast<double>(rocksdb::perf_context.write_pre_and_post_process_time)/1000000000);
+    logger->tinc(l_rocksdb_write_memtable_time, write_memtable_time);
+    logger->tinc(l_rocksdb_write_delay_time, write_delay_time);
+    logger->tinc(l_rocksdb_write_wal_time, write_wal_time);
+    logger->tinc(l_rocksdb_write_pre_and_post_process_time, write_pre_and_post_process_time);
+  }
 
   logger->inc(l_rocksdb_txns);
   logger->tinc(l_rocksdb_submit_latency, lat);
-  logger->tinc(l_rocksdb_write_memtable_time, write_memtable_time);
-  logger->tinc(l_rocksdb_write_delay_time, write_delay_time);
-  logger->tinc(l_rocksdb_write_wal_time, write_wal_time);
-  logger->tinc(l_rocksdb_write_pre_and_post_process_time, write_pre_and_post_process_time);
 
   return s.ok() ? 0 : -1;
 }
@@ -441,43 +444,30 @@ int RocksDBStore::submit_transaction_sync(KeyValueDB::Transaction t)
          << " Rocksdb transaction: " << rocks_txc.seen << dendl;
   }
   utime_t lat = ceph_clock_now(g_ceph_context) - start;
-  utime_t write_memtable_time;
-  utime_t write_delay_time;
-  utime_t write_wal_time;
-  utime_t write_pre_and_post_process_time;
-  write_wal_time.set_from_double(
-      static_cast<double>(rocksdb::perf_context.write_wal_time)/1000000000);
-  write_memtable_time.set_from_double(
-      static_cast<double>(rocksdb::perf_context.write_memtable_time)/1000000000);
-  write_delay_time.set_from_double(
-      static_cast<double>(rocksdb::perf_context.write_delay_time)/1000000000);
-  write_pre_and_post_process_time.set_from_double(
-      static_cast<double>(rocksdb::perf_context.write_pre_and_post_process_time)/1000000000);
+
+  if (g_conf->rocksdb_perf) {
+    utime_t write_memtable_time;
+    utime_t write_delay_time;
+    utime_t write_wal_time;
+    utime_t write_pre_and_post_process_time;
+    write_wal_time.set_from_double(
+	static_cast<double>(rocksdb::perf_context.write_wal_time)/1000000000);
+    write_memtable_time.set_from_double(
+	static_cast<double>(rocksdb::perf_context.write_memtable_time)/1000000000);
+    write_delay_time.set_from_double(
+	static_cast<double>(rocksdb::perf_context.write_delay_time)/1000000000);
+    write_pre_and_post_process_time.set_from_double(
+	static_cast<double>(rocksdb::perf_context.write_pre_and_post_process_time)/1000000000);
+    logger->tinc(l_rocksdb_write_memtable_time, write_memtable_time);
+    logger->tinc(l_rocksdb_write_delay_time, write_delay_time);
+    logger->tinc(l_rocksdb_write_wal_time, write_wal_time);
+    logger->tinc(l_rocksdb_write_pre_and_post_process_time, write_pre_and_post_process_time);
+  }
 
   logger->inc(l_rocksdb_txns_sync);
   logger->tinc(l_rocksdb_submit_sync_latency, lat);
-  logger->tinc(l_rocksdb_write_memtable_time, write_memtable_time);
-  logger->tinc(l_rocksdb_write_delay_time, write_delay_time);
-  logger->tinc(l_rocksdb_write_wal_time, write_wal_time);
-  logger->tinc(l_rocksdb_write_pre_and_post_process_time, write_pre_and_post_process_time);
 
   return s.ok() ? 0 : -1;
-}
-int RocksDBStore::get_info_log_level(string info_log_level)
-{
-  if (info_log_level == "debug") {
-    return 0;
-  } else if (info_log_level == "info") {
-    return 1;
-  } else if (info_log_level == "warn") {
-    return 2;
-  } else if (info_log_level == "error") {
-    return 3;
-  } else if (info_log_level == "fatal") {
-    return 4;
-  } else {
-    return 1;
-  }
 }
 
 RocksDBStore::RocksDBTransactionImpl::RocksDBTransactionImpl(RocksDBStore *_db)
@@ -829,19 +819,3 @@ RocksDBStore::WholeSpaceIterator RocksDBStore::_get_iterator()
         db->NewIterator(rocksdb::ReadOptions()));
 }
 
-RocksDBStore::WholeSpaceIterator RocksDBStore::_get_snapshot_iterator()
-{
-  const rocksdb::Snapshot *snapshot;
-  rocksdb::ReadOptions options;
-
-  snapshot = db->GetSnapshot();
-  options.snapshot = snapshot;
-
-  return std::make_shared<RocksDBSnapshotIteratorImpl>(
-          db, snapshot, db->NewIterator(options));
-}
-
-RocksDBStore::RocksDBSnapshotIteratorImpl::~RocksDBSnapshotIteratorImpl()
-{
-  db->ReleaseSnapshot(snapshot);
-}

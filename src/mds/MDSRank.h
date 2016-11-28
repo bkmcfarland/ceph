@@ -208,7 +208,7 @@ class MDSRank {
       Cond cond;
       public:
       explicit ProgressThread(MDSRank *mds_) : mds(mds_) {}
-      void * entry(); 
+      void * entry() override;
       void shutdown();
       void signal() {cond.Signal();}
     } progress_thread;
@@ -280,7 +280,11 @@ class MDSRank {
         MonClient *monc_,
         Context *respawn_hook_,
         Context *suicide_hook_);
+
+  protected:
     ~MDSRank();
+
+  public:
 
     // Daemon lifetime functions: these guys break the abstraction
     // and call up into the parent MDSDaemon instance.  It's kind
@@ -492,7 +496,7 @@ public:
                            Formatter *f, std::ostream& ss);
   void handle_mds_map(MMDSMap *m, MDSMap *oldmap);
   void handle_osd_map();
-  bool kill_session(int64_t session_id);
+  bool kill_session(int64_t session_id, bool wait, std::stringstream& ss);
   void update_log_config();
   bool handle_command_legacy(std::vector<std::string> args);
 

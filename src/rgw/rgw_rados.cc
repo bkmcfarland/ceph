@@ -3334,9 +3334,9 @@ int RGWRados::convert_regionmap()
 {
   RGWZoneGroupMap zonegroupmap;
 
-  string pool_name = cct->_conf->rgw_zone_root_pool;
+  string pool_name = cct->_conf->rgw_region_root_pool;
   if (pool_name.empty()) {
-    pool_name = RGW_DEFAULT_ZONE_ROOT_POOL;
+    pool_name = RGW_DEFAULT_ZONEGROUP_ROOT_POOL;
   }
   string oid = region_map_oid; 
 
@@ -3688,9 +3688,29 @@ int RGWRados::init_zg_from_period(bool *initialized)
     // use endpoints from the zonegroup's master zone
     auto master = zg.zones.find(zg.master_zone);
     if (master == zg.zones.end()) {
-      ldout(cct, 0) << "zonegroup " << zg.get_name() << " missing zone for "
-          "master_zone=" << zg.master_zone << dendl;
-      return -EINVAL;
+      // fix missing master zone for a single zone zonegroup
+      if (zg.master_zone.empty() && zg.zones.size() == 1) {
+	master = zg.zones.begin();
+	ldout(cct, 0) << "zonegroup " << zg.get_name() << " missing master_zone, setting zone " <<
+	  master->second.name << " id:" << master->second.id << " as master" << dendl;
+	if (zonegroup.get_id() == zg.get_id()) {
+	  zonegroup.master_zone = master->second.id;
+	  zonegroup.update();
+	} else {
+	  RGWZoneGroup fixed_zg(zg.get_id(),zg.get_name());
+	  ret = fixed_zg.init(cct, this);
+	  if (ret < 0) {
+	    ldout(cct, 0) << "error initializing zonegroup : " << cpp_strerror(-ret) << dendl;
+	    return ret;
+	  }
+	  fixed_zg.master_zone = master->second.id;
+	  fixed_zg.update();
+	}
+      } else {
+	ldout(cct, 0) << "zonegroup " << zg.get_name() << " missing zone for master_zone=" <<
+	  zg.master_zone << dendl;
+	return -EINVAL;
+      }
     }
     const auto& endpoints = master->second.endpoints;
     add_new_connection_to_map(zonegroup_conn_map, zg, new RGWRESTConn(cct, this, zg.get_id(), endpoints));
@@ -3732,9 +3752,18 @@ int RGWRados::init_zg_from_local(bool *creating_defaults)
     // use endpoints from the zonegroup's master zone
     auto master = zonegroup.zones.find(zonegroup.master_zone);
     if (master == zonegroup.zones.end()) {
-      ldout(cct, 0) << "zonegroup " << zonegroup.get_name() << " missing zone for "
+      // fix missing master zone for a single zone zonegroup
+      if (zonegroup.master_zone.empty() && zonegroup.zones.size() == 1) {
+	master = zonegroup.zones.begin();
+	ldout(cct, 0) << "zonegroup " << zonegroup.get_name() << " missing master_zone, setting zone " <<
+	  master->second.name << " id:" << master->second.id << " as master" << dendl;
+	zonegroup.master_zone = master->second.id;
+	zonegroup.update();
+      } else {
+	ldout(cct, 0) << "zonegroup " << zonegroup.get_name() << " missing zone for "
           "master_zone=" << zonegroup.master_zone << dendl;
-      return -EINVAL;
+	return -EINVAL;
+      }
     }
     const auto& endpoints = master->second.endpoints;
     rest_master_conn = new RGWRESTConn(cct, this, zonegroup.get_id(), endpoints);
@@ -5903,7 +5932,7 @@ int RGWRados::fix_tail_obj_locator(rgw_bucket& bucket, rgw_obj_key& key, bool fi
 
   RGWObjState *astate = NULL;
   RGWObjectCtx rctx(this);
-  r = get_obj_state(&rctx, obj, &astate, NULL);
+  r = get_obj_state(&rctx, obj, &astate, false);
   if (r < 0)
     return r;
 
@@ -7070,12 +7099,20 @@ int RGWRados::fetch_remote_obj(RGWObjectCtx& obj_ctx,
   }
 
   boost::optional<RGWPutObj_Compress> compressor;
+  CompressorRef plugin;
 
   RGWPutObjDataProcessor *filter = &processor;
-  bool compression_enabled = cct->_conf->rgw_compression_type != "none";
-  if (compression_enabled) {
-    compressor = boost::in_place(cct, filter);
-    filter = &*compressor;
+
+  const auto& compression_type = cct->_conf->rgw_compression_type;
+  if (compression_type != "none") {
+    plugin = Compressor::create(cct, compression_type);
+    if (!plugin) {
+      ldout(cct, 1) << "Cannot load plugin for rgw_compression_type "
+          << compression_type << dendl;
+    } else {
+      compressor = boost::in_place(cct, plugin, filter);
+      filter = &*compressor;
+    }
   }
 
   RGWRadosPutObj cb(cct, filter, &processor, opstate, progress_cb, progress_data);
@@ -7092,7 +7129,7 @@ int RGWRados::fetch_remote_obj(RGWObjectCtx& obj_ctx,
 
   if (copy_if_newer) {
     /* need to get mtime for destination */
-    ret = get_obj_state(&obj_ctx, dest_obj, &dest_state, NULL);
+    ret = get_obj_state(&obj_ctx, dest_obj, &dest_state, false);
     if (ret < 0)
       goto set_err_state;
 
@@ -7142,10 +7179,10 @@ int RGWRados::fetch_remote_obj(RGWObjectCtx& obj_ctx,
 	}
       }
     }
-    if (compression_enabled && compressor->is_compressed()) {
+    if (compressor && compressor->is_compressed()) {
       bufferlist tmp;
       RGWCompressionInfo cs_info;
-      cs_info.compression_type = cct->_conf->rgw_compression_type;
+      cs_info.compression_type = plugin->get_type_name();
       cs_info.orig_size = cb.get_data_len();
       cs_info.blocks = move(compressor->get_compression_blocks());
       ::encode(cs_info, tmp);
@@ -7194,7 +7231,7 @@ int RGWRados::fetch_remote_obj(RGWObjectCtx& obj_ctx,
     if (copy_if_newer && cb.is_canceled()) {
       ldout(cct, 20) << "raced with another write of obj: " << dest_obj << dendl;
       obj_ctx.invalidate(dest_obj); /* object was overwritten */
-      ret = get_obj_state(&obj_ctx, dest_obj, &dest_state, NULL);
+      ret = get_obj_state(&obj_ctx, dest_obj, &dest_state, false);
       if (ret < 0) {
         ldout(cct, 0) << "ERROR: " << __func__ << ": get_err_state() returned ret=" << ret << dendl;
         goto set_err_state;
@@ -7624,8 +7661,7 @@ int RGWRados::copy_obj_data(RGWObjectCtx& obj_ctx,
     }
   }
 
-  // pass original size if compressed
-  uint64_t accounted_size = ofs;
+  uint64_t accounted_size;
   {
     bool compressed{false};
     RGWCompressionInfo cs_info;
@@ -7634,7 +7670,8 @@ int RGWRados::copy_obj_data(RGWObjectCtx& obj_ctx,
       ldout(cct, 0) << "ERROR: failed to read compression info" << dendl;
       return ret;
     }
-    accounted_size = cs_info.orig_size;
+    // pass original size if compressed
+    accounted_size = compressed ? cs_info.orig_size : ofs;
   }
 
   return processor.complete(accounted_size, etag, mtime, set_mtime, attrs, delete_at);
@@ -7820,6 +7857,10 @@ int RGWRados::Object::complete_atomic_modification()
 
   cls_rgw_obj_chain chain;
   store->update_gc_chain(obj, state->manifest, &chain);
+
+  if (chain.empty()) {
+    return 0;
+  }
 
   string tag = state->obj_tag.to_str();
   return store->gc->send_chain(chain, tag, false);  // do it async
@@ -8031,7 +8072,7 @@ int RGWRados::defer_gc(void *ctx, rgw_obj& obj)
 
   RGWObjState *state = NULL;
 
-  int r = get_obj_state(rctx, obj, &state, NULL);
+  int r = get_obj_state(rctx, obj, &state, false);
   if (r < 0)
     return r;
 
@@ -8723,7 +8764,7 @@ int RGWRados::append_atomic_test(RGWObjectCtx *rctx, rgw_obj& obj,
   if (!rctx)
     return 0;
 
-  int r = get_obj_state(rctx, obj, pstate, NULL);
+  int r = get_obj_state(rctx, obj, pstate, false);
   if (r < 0)
     return r;
 
@@ -9928,7 +9969,7 @@ int RGWRados::iterate_obj(RGWObjectCtx& obj_ctx, rgw_obj& obj,
   bool reading_from_head = true;
   RGWObjState *astate = NULL;
 
-  int r = get_obj_state(&obj_ctx, obj, &astate, NULL);
+  int r = get_obj_state(&obj_ctx, obj, &astate, false);
   if (r < 0) {
     return r;
   }
@@ -12073,7 +12114,7 @@ int RGWRados::check_disk_state(librados::IoCtx io_ctx,
 
   RGWObjState *astate = NULL;
   RGWObjectCtx rctx(this);
-  int r = get_obj_state(&rctx, obj, &astate, NULL);
+  int r = get_obj_state(&rctx, obj, &astate, false);
   if (r < 0)
     return r;
 

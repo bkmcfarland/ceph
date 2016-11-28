@@ -2054,8 +2054,10 @@ int FileStore::queue_transactions(Sequencer *posr, vector<Transaction>& tls,
   Context *onreadable_sync;
   ObjectStore::Transaction::collect_contexts(
     tls, &onreadable, &ondisk, &onreadable_sync);
-  if (g_conf->filestore_blackhole) {
-    dout(0) << "queue_transactions filestore_blackhole = TRUE, dropping transaction" << dendl;
+
+  if (g_conf->objectstore_blackhole) {
+    dout(0) << __func__ << " objectstore_blackhole = TRUE, dropping transaction"
+	    << dendl;
     delete ondisk;
     delete onreadable;
     delete onreadable_sync;
@@ -2120,7 +2122,7 @@ int FileStore::queue_transactions(Sequencer *posr, vector<Transaction>& tls,
 			       new C_JournaledAhead(this, osr, o, ondisk),
 			       osd_op);
     } else {
-      assert(0);
+      ceph_abort();
     }
     submit_manager.op_submit_finish(op_num);
     utime_t end = ceph_clock_now(g_ceph_context);
@@ -2707,22 +2709,6 @@ void FileStore::_do_transaction(
       }
       break;
 
-    case Transaction::OP_MERGE_DELETE:
-      {
-        ghobject_t src_oid = i.get_oid(op->oid);
-        coll_t cid = i.get_cid(op->cid);
-        ghobject_t oid = i.get_oid(op->dest_oid);
-        coll_t src_cid = i.get_cid(op->cid);
-        _kludge_temp_object_collection(cid, oid);
-        _kludge_temp_object_collection(src_cid, src_oid);
-        vector<std::pair<uint64_t, uint64_t>> move_info;
-        i.decode_move_info(move_info);
-        tracepoint(objectstore, move_ranges_destroy_src_enter, osr_name);
-        r = _move_ranges_destroy_src(src_cid, src_oid, cid, oid, move_info, spos);
-        tracepoint(objectstore, move_ranges_destroy_src_exit, r);
-      }
-      break;
-
     case Transaction::OP_MKCOLL:
       {
         coll_t cid = i.get_cid(op->cid);
@@ -2947,7 +2933,7 @@ void FileStore::_do_transaction(
 
     default:
       derr << "bad op " << op->op << dendl;
-      assert(0);
+      ceph_abort();
     }
 
     if (r < 0) {
@@ -3742,7 +3728,12 @@ int FileStore::_do_copy_range(int from, int to, uint64_t srcoff, uint64_t len, u
     }
   }
 
-  assert(pos == end);
+  if (r < 0 && replaying) {
+    assert(r == -ERANGE);
+    derr << "Filestore: short source tolerated because we are replaying" << dendl;
+    r = pos - from;;
+  }
+  assert(replaying || pos == end);
   if (r >= 0 && !skip_sloppycrc && m_filestore_sloppy_crc) {
     int rc = backend->_crc_update_clone_range(from, to, srcoff, len, dstoff);
     assert(rc >= 0);
@@ -3785,88 +3776,6 @@ int FileStore::_clone_range(const coll_t& oldcid, const ghobject_t& oldoid, cons
  out2:
   dout(10) << "clone_range " << oldcid << "/" << oldoid << " -> " << newcid << "/" << newoid << " "
 	   << srcoff << "~" << len << " to " << dstoff << " = " << r << dendl;
-  return r;
-}
-
-/*
- * Move contents of src object according to move_info to base object. Once the move_info is traversed completely, delete the src object.
- */
-int FileStore::_move_ranges_destroy_src(
-  const coll_t& src_cid, const ghobject_t& src_oid,
-  const coll_t& cid, const ghobject_t& oid,
-  const vector<std::pair<uint64_t, uint64_t>> move_info,
-  const SequencerPosition& spos)
-{
-  int r = 0;
-
-  dout(10) << __func__ << src_cid << "/" << src_oid << " -> "
-	   << cid << "/" << oid << dendl;
-
-  // check replay guard for base object. If not possible to replay, return.
-  int dstcmp = _check_replay_guard(cid, oid, spos);
-  if (dstcmp < 0)
-    return 0;
-
-  // check the src name too; it might have a newer guard, and we don't
-  // want to clobber it
-  int srccmp = _check_replay_guard(src_cid, src_oid, spos);
-  if (srccmp < 0)
-    return 0;
-
-  FDRef b;
-  r = lfn_open(cid, oid, true, &b);
-  if (r < 0) {
-    return 0;
-  }
-
-  FDRef t;
-  r = lfn_open(src_cid, src_oid, false, &t);
-  //If we are replaying, it is possible that we do not find src obj as
-  //it is deleted before crashing.
-  if (r < 0) {
-    lfn_close(b);
-    dout(10) << __func__ << " replaying -->" << replaying  << dendl;
-    if (replaying) {
-      _set_replay_guard(**b, spos, &oid);
-      return 0;
-    } else {
-      return -ENOENT;
-    }
-  }
-
-  for (unsigned i = 0; i < move_info.size(); ++i) {
-    uint64_t off = move_info[i].first;
-    uint64_t len = move_info[i].second;
-    r = _do_clone_range(**t, **b, off, len, off);
-    if (r < 0)
-      break;
-  }
-
-  dout(10) << __func__  << cid << "/" << oid << " "  <<  " = " << r << dendl;
-
-  lfn_close(t);
-
-  //In case crash occurs here, replay will have to do cloning again.
-  //Only if do_clone_range is successful, go ahead with deleting the source object.
-  if (r < 0)
-    goto out;
-
-  r = lfn_unlink(src_cid, src_oid, spos, true);
-  // If crash occurs between unlink and set guard, correct the error.
-  // as during next time, it might not find the already deleted object.
-  if (r < 0 && replaying) {
-    r = 0;
-  }
-
-  if (r < 0)
-    goto out;
-
-  //set replay guard for base obj coll_t, as this api is not idempotent.
-  _set_replay_guard(**b, spos, &oid);
-
-out:
-  lfn_close(b);
-  dout(10) << __func__  << cid << "/" << oid << " "  <<  " = " << r << dendl;
   return r;
 }
 
@@ -3949,7 +3858,7 @@ void FileStore::sync_entry()
       stringstream errstream;
       if (g_conf->filestore_debug_omap_check && !object_map->check(errstream)) {
 	derr << errstream.str() << dendl;
-	assert(0);
+	ceph_abort();
       }
 
       if (backend->can_checkpoint()) {
@@ -4136,7 +4045,7 @@ void FileStore::flush()
     lock.Lock();
     while (true)
       cond.Wait(lock);
-    assert(0);
+    ceph_abort();
   }
 
   if (m_filestore_journal_writeahead) {
@@ -4729,11 +4638,8 @@ int FileStore::list_collections(vector<coll_t>& ls, bool include_temp)
     return r;
   }
 
-  char buf[offsetof(struct dirent, d_name) + PATH_MAX + 1];
-  struct dirent *de;
-  while ((r = ::readdir_r(dir, (struct dirent *)&buf, &de)) == 0) {
-    if (!de)
-      break;
+  struct dirent *de = nullptr;
+  while ((de = ::readdir(dir))) {
     if (de->d_type == DT_UNKNOWN) {
       // d_type not supported (non-ext[234], btrfs), must stat
       struct stat sb;
@@ -4771,7 +4677,7 @@ int FileStore::list_collections(vector<coll_t>& ls, bool include_temp)
   }
 
   if (r > 0) {
-    derr << "trying readdir_r " << fn << ": " << cpp_strerror(r) << dendl;
+    derr << "trying readdir " << fn << ": " << cpp_strerror(r) << dendl;
     r = -r;
   }
 
@@ -5522,7 +5428,7 @@ int FileStore::_split_collection(const coll_t& cid,
     _close_replay_guard(cid, spos);
     _close_replay_guard(dest, spos);
   }
-  if (g_conf->filestore_debug_verify_split) {
+  if (!r && g_conf->filestore_debug_verify_split) {
     vector<ghobject_t> objects;
     ghobject_t next;
     while (1) {
