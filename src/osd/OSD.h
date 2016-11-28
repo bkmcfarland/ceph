@@ -24,6 +24,10 @@
 #include "common/Timer.h"
 #include "common/WorkQueue.h"
 #include "common/AsyncReserver.h"
+#include "common/ceph_context.h"
+
+#include "mgr/MgrClient.h"
+
 #include "os/ObjectStore.h"
 #include "OSDCap.h" 
  
@@ -153,6 +157,10 @@ enum {
   l_osd_tier_flush_lat,
   l_osd_tier_promote_lat,
   l_osd_tier_r_lat,
+
+  l_osd_pg_info,
+  l_osd_pg_fastinfo,
+  l_osd_pg_biginfo,
 
   l_osd_last,
 };
@@ -845,7 +853,6 @@ public:
   Objecter *objecter;
   Finisher objecter_finisher;
 
-
   // -- Watch --
   Mutex watch_lock;
   SafeTimer watch_timer;
@@ -907,6 +914,7 @@ public:
 	  entity_inst_t())));
   }
 
+private:
   // -- pg recovery and associated throttling --
   Mutex recovery_lock;
   list<pair<epoch_t, PGRef> > awaiting_throttle;
@@ -918,10 +926,24 @@ public:
 #ifdef DEBUG_RECOVERY_OIDS
   map<spg_t, set<hobject_t, hobject_t::BitwiseComparator> > recovery_oids;
 #endif
-  void start_recovery_op(PG *pg, const hobject_t& soid);
-  void finish_recovery_op(PG *pg, const hobject_t& soid, bool dequeue);
   bool _recover_now(uint64_t *available_pushes);
   void _maybe_queue_recovery();
+  void _queue_for_recovery(
+    pair<epoch_t, PGRef> p, uint64_t reserved_pushes) {
+    assert(recovery_lock.is_locked_by_me());
+    pair<PGRef, PGQueueable> to_queue = make_pair(
+      p.second,
+      PGQueueable(
+	PGRecovery(p.first, reserved_pushes),
+	cct->_conf->osd_recovery_cost,
+	cct->_conf->osd_recovery_priority,
+	ceph_clock_now(cct),
+	entity_inst_t()));
+    op_wq.queue(to_queue);
+  }
+public:
+  void start_recovery_op(PG *pg, const hobject_t& soid);
+  void finish_recovery_op(PG *pg, const hobject_t& soid, bool dequeue);
   void release_reserved_pushes(uint64_t pushes) {
     Mutex::Locker l(recovery_lock);
     assert(recovery_ops_reserved >= pushes);
@@ -955,7 +977,7 @@ public:
 	 i != awaiting_throttle.end();
       ) {
       if (i->second.get() == pg) {
-	awaiting_throttle.erase(i++);
+	awaiting_throttle.erase(i);
 	return;
       } else {
 	++i;
@@ -973,19 +995,6 @@ public:
     _maybe_queue_recovery();
   }
 
-  void _queue_for_recovery(
-    pair<epoch_t, PGRef> p, uint64_t reserved_pushes) {
-    assert(recovery_lock.is_locked_by_me());
-    pair<PGRef, PGQueueable> to_queue = make_pair(
-      p.second,
-      PGQueueable(
-	PGRecovery(p.first, reserved_pushes),
-	cct->_conf->osd_recovery_cost,
-	cct->_conf->osd_recovery_priority,
-	ceph_clock_now(cct),
-	entity_inst_t()));
-    op_wq.queue(to_queue);
-  }
 
   // osd map cache (past osd maps)
   Mutex map_cache_lock;
@@ -1131,10 +1140,10 @@ public:
   void set_state(int s) {
     state = s;
   }
-  bool is_stopping() {
+  bool is_stopping() const {
     return state == STOPPING;
   }
-  bool is_preparing_to_stop() {
+  bool is_preparing_to_stop() const {
     return state == PREPARING_TO_STOP;
   }
   bool prepare_to_stop();
@@ -1181,6 +1190,12 @@ public:
 class OSD : public Dispatcher,
 	    public md_config_obs_t {
   /** OSD **/
+  Mutex osd_lock;			// global lock
+  SafeTimer tick_timer;    // safe timer (osd_lock)
+
+  // Tick timer for those stuff that do not need osd_lock
+  Mutex tick_timer_lock;
+  SafeTimer tick_timer_without_osd_lock;
 public:
   // config observer bits
   virtual const char** get_tracked_conf_keys() const;
@@ -1190,12 +1205,6 @@ public:
   void check_config();
 
 protected:
-  Mutex osd_lock;			// global lock
-  SafeTimer tick_timer;    // safe timer (osd_lock)
-
-  // Tick timer for those stuff that do not need osd_lock
-  Mutex tick_timer_lock;
-  SafeTimer tick_timer_without_osd_lock;
 
   static const double OSD_TICK_INTERVAL; // tick interval for tick_timer and tick_timer_without_osd_lock
 
@@ -1206,6 +1215,7 @@ protected:
   Messenger   *client_messenger;
   Messenger   *objecter_messenger;
   MonClient   *monc; // check the "monc helpers" list before accessing directly
+  MgrClient   mgrc;
   PerfCounters      *logger;
   PerfCounters      *recoverystate_perf;
   ObjectStore *store;
@@ -1234,7 +1244,7 @@ protected:
   bool asok_command(string command, cmdmap_t& cmdmap, string format, ostream& ss);
 
 public:
-  ClassHandler  *class_handler;
+  ClassHandler  *class_handler = nullptr;
   int get_nodeid() { return whoami; }
   
   static ghobject_t get_osdmap_pobject_name(epoch_t epoch) {
@@ -1340,28 +1350,28 @@ private:
   std::atomic_int state{STATE_INITIALIZING};
 
 public:
-  int get_state() {
+  int get_state() const {
     return state;
   }
   void set_state(int s) {
     state = s;
   }
-  bool is_initializing() {
+  bool is_initializing() const {
     return state == STATE_INITIALIZING;
   }
-  bool is_preboot() {
+  bool is_preboot() const {
     return state == STATE_PREBOOT;
   }
-  bool is_booting() {
+  bool is_booting() const {
     return state == STATE_BOOTING;
   }
-  bool is_active() {
+  bool is_active() const {
     return state == STATE_ACTIVE;
   }
-  bool is_stopping() {
+  bool is_stopping() const {
     return state == STATE_STOPPING;
   }
-  bool is_waiting_for_healthy() {
+  bool is_waiting_for_healthy() const {
     return state == STATE_WAITING_FOR_HEALTHY;
   }
 
@@ -1606,7 +1616,7 @@ private:
     utime_t last_rx_back;   ///< last time we got a ping reply on the back side
     epoch_t epoch;      ///< most recent epoch we wanted this peer
 
-    bool is_unhealthy(utime_t cutoff) {
+    bool is_unhealthy(utime_t cutoff) const {
       return
 	! ((last_rx_front > cutoff ||
 	    (last_rx_front == utime_t() && (last_tx == utime_t() ||
@@ -1615,7 +1625,7 @@ private:
 	    (last_rx_back == utime_t() && (last_tx == utime_t() ||
 					   first_tx > cutoff))));
     }
-    bool is_healthy(utime_t cutoff) {
+    bool is_healthy(utime_t cutoff) const {
       return last_rx_front > cutoff && last_rx_back > cutoff;
     }
 
@@ -1702,6 +1712,9 @@ public:
       return osd->heartbeat_reset(con);
     }
     void ms_handle_remote_reset(Connection *con) {}
+    bool ms_handle_refused(Connection *con) {
+      return osd->ms_handle_refused(con);
+    }
     bool ms_verify_authorizer(Connection *con, int peer_type,
 			      int protocol, bufferlist& authorizer_data, bufferlist& authorizer_reply,
 			      bool& isvalid, CryptoKey& session_key) {
@@ -1892,7 +1905,7 @@ private:
   } op_shardedwq;
 
 
-  void enqueue_op(PG *pg, OpRequestRef& op);
+  void enqueue_op(PGRef pg, OpRequestRef& op);
   void dequeue_op(
     PGRef pg, OpRequestRef op,
     ThreadPool::TPHandle &handle);
@@ -2025,11 +2038,9 @@ protected:
 
   PGPool _get_pool(int id, OSDMapRef createmap);
 
-  PG *get_pg_or_queue_for_pg(const spg_t& pgid, OpRequestRef& op);
-  bool  _have_pg(spg_t pgid);
+  PGRef get_pg_or_queue_for_pg(const spg_t& pgid, OpRequestRef& op);
   PG   *_lookup_lock_pg_with_map_lock_held(spg_t pgid);
   PG   *_lookup_lock_pg(spg_t pgid);
-  PG   *_lookup_pg(spg_t pgid);
   PG   *_open_lock_pg(OSDMapRef createmap,
 		      spg_t pg, bool no_lockdep_check=false);
   enum res_result {
@@ -2131,8 +2142,6 @@ protected:
   void _preboot(epoch_t oldest, epoch_t newest);
   void _send_boot();
   void _collect_metadata(map<string,string> *pmeta);
-  bool _lsb_release_set(char *buf, const char *str, map<string,string> *pm, const char *key);
-  void _lsb_release_parse (map<string,string> *pm);
 
   void start_waiting_for_healthy();
   bool _is_healthy();
@@ -2397,6 +2406,7 @@ protected:
   void ms_handle_fast_accept(Connection *con);
   bool ms_handle_reset(Connection *con);
   void ms_handle_remote_reset(Connection *con) {}
+  bool ms_handle_refused(Connection *con);
 
   io_queue get_io_queue() const {
     if (cct->_conf->osd_op_queue == "debug_random") {
@@ -2436,7 +2446,6 @@ protected:
   ~OSD();
 
   // static bits
-  static int find_osd_dev(char *result, int whoami);
   static int mkfs(CephContext *cct, ObjectStore *store,
 		  const string& dev,
 		  uuid_d fsid, int whoami);
@@ -2457,6 +2466,7 @@ private:
   static int write_meta(ObjectStore *store,
 			uuid_d& cluster_fsid, uuid_d& osd_fsid, int whoami);
 
+  void handle_pg_scrub(struct MOSDScrub *m, PG* pg);
   void handle_scrub(struct MOSDScrub *m);
   void handle_osd_ping(class MOSDPing *m);
   void handle_op(OpRequestRef& op, OSDMapRef& osdmap);

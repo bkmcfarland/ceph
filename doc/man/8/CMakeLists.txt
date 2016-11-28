@@ -13,8 +13,11 @@ set(server_srcs
   ceph-run.rst
   mount.ceph.rst
   ceph-create-keys.rst
-  ceph-rest-api.rst
+  ceph-rest-api.rst)
+if(WITH_TESTS)
+list(APPEND server_srcs
   ceph-debugpack.rst)
+endif(WITH_TESTS)
 
 set(osd_srcs
   ceph-clsinfo.rst
@@ -34,11 +37,6 @@ list(APPEND man_srcs
   ${mon_srcs}
   ceph-mds.rst
   librados-config.rst)
-
-if(WITH_CEPHFS)
-  list(APPEND man_srcs
-    cephfs.rst)
-endif()
 
 if(HAVE_LIBFUSE)
   list(APPEND man_srcs

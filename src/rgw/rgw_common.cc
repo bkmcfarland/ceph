@@ -175,9 +175,9 @@ req_state::req_state(CephContext* _cct, RGWEnv* e, RGWUserInfo* u)
   : cct(_cct), cio(NULL), op(OP_UNKNOWN), user(u), has_acl_header(false),
     info(_cct, e)
 {
-  enable_ops_log = e->conf->enable_ops_log;
-  enable_usage_log = e->conf->enable_usage_log;
-  defer_to_bucket_acls = e->conf->defer_to_bucket_acls;
+  enable_ops_log = e->conf.enable_ops_log;
+  enable_usage_log = e->conf.enable_usage_log;
+  defer_to_bucket_acls = e->conf.defer_to_bucket_acls;
   content_started = false;
   format = 0;
   formatter = NULL;
@@ -474,6 +474,32 @@ int parse_time(const char *time_str, real_time *time)
   return 0;
 }
 
+#define TIME_BUF_SIZE 128
+
+void rgw_to_iso8601(const real_time& t, char *dest, int buf_size)
+{
+  utime_t ut(t);
+
+  char buf[TIME_BUF_SIZE];
+  struct tm result;
+  time_t epoch = ut.sec();
+  struct tm *tmp = gmtime_r(&epoch, &result);
+  if (tmp == NULL)
+    return;
+
+  if (strftime(buf, sizeof(buf), "%Y-%m-%dT%T", tmp) == 0)
+    return;
+
+  snprintf(dest, buf_size, "%s.%03dZ", buf, (int)(ut.usec() / 1000));
+}
+
+void rgw_to_iso8601(const real_time& t, string *dest)
+{
+  char buf[TIME_BUF_SIZE];
+  rgw_to_iso8601(t, buf, sizeof(buf));
+  *dest = buf;
+}
+
 /*
  * calculate the sha1 value of a given msg and key
  */
@@ -746,6 +772,7 @@ void RGWHTTPArgs::append(const string& name, const string& val)
       (name.compare("location") == 0) ||
       (name.compare("logging") == 0) ||
       (name.compare("usage") == 0) ||
+      (name.compare("lifecycle") == 0) ||
       (name.compare("delete") == 0) ||
       (name.compare("uploads") == 0) ||
       (name.compare("partNumber") == 0) ||
@@ -1106,6 +1133,14 @@ void url_encode(const string& src, string& dst)
 
     dst.append(p, 1);
   }
+}
+
+std::string url_encode(const std::string& src)
+{
+  std::string dst;
+  url_encode(src, dst);
+
+  return dst;
 }
 
 string rgw_trim_whitespace(const string& src)

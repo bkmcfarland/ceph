@@ -20,6 +20,7 @@
 #include "common/debug.h"
 #include "common/errno.h"
 #include "common/strtol.h"
+#include "common/version.h"
 
 #ifdef HAVE_SYS_VFS_H
 #include <sys/vfs.h>
@@ -150,33 +151,6 @@ static void file_values_parse(const map<string, string>& kvm, FILE *fp, map<stri
   }
 }
 
-static bool lsb_release_parse(map<string, string> *m, CephContext *cct)
-{
-  static const map<string, string> kvm = {
-      { "distro", "Distributor ID:" },
-      { "distro_description", "Description:" },
-      { "distro_codename", "Codename:", },
-      { "distro_version", "Release:" }
-  };
-
-  FILE *fp = popen("lsb_release -idrc", "r");
-  if (!fp) {
-    int ret = -errno;
-    lderr(cct) << "lsb_release_parse - failed to call lsb_release binary with error: " << cpp_strerror(ret) << dendl;
-    return false;
-  }
-
-  file_values_parse(kvm, fp, m, cct);
-
-  if (pclose(fp)) {
-    int ret = -errno;
-    lderr(cct) << "lsb_release_parse - pclose failed: " << cpp_strerror(ret) << dendl;
-    return false;
-  }
-
-  return true;
-}
-
 static bool os_release_parse(map<string, string> *m, CephContext *cct)
 {
   static const map<string, string> kvm = {
@@ -201,8 +175,8 @@ static bool os_release_parse(map<string, string> *m, CephContext *cct)
 
 static void distro_detect(map<string, string> *m, CephContext *cct)
 {
-  if (!lsb_release_parse(m, cct) && !os_release_parse(m, cct)) {
-    lderr(cct) << "distro_detect - lsb_release or /etc/os-release is required" << dendl;
+  if (!os_release_parse(m, cct)) {
+    lderr(cct) << "distro_detect - /etc/os-release is required" << dendl;
   }
 
   for (const char* rk: {"distro", "distro_version"}) {
@@ -213,6 +187,9 @@ static void distro_detect(map<string, string> *m, CephContext *cct)
 
 void collect_sys_info(map<string, string> *m, CephContext *cct)
 {
+  // version
+  (*m)["ceph_version"] = pretty_version_to_str();
+
   // kernel info
   struct utsname u;
   int r = uname(&u);

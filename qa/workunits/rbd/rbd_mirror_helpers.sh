@@ -120,7 +120,29 @@ daemon_pid_file()
 
 testlog()
 {
-    echo $(date '+%F %T') $@ | tee -a "${TEMPDIR}/rbd-mirror.test.log"
+    echo $(date '+%F %T') $@ | tee -a "${TEMPDIR}/rbd-mirror.test.log" >&2
+}
+
+expect_failure()
+{
+    local expected="$1" ; shift
+    local out=${TEMPDIR}/expect_failure.out
+
+    if "$@" > ${out} 2>&1 ; then
+        cat ${out} >&2
+        return 1
+    fi
+
+    if [ -z "${expected}" ]; then
+	return 0
+    fi
+
+    if ! grep -q "${expected}" ${out} ; then
+        cat ${out} >&2
+        return 1
+    fi
+
+    return 0
 }
 
 setup()
@@ -197,6 +219,7 @@ start_mirror()
 	--pid-file=$(daemon_pid_file "${cluster}") \
 	--log-file=${TEMPDIR}/rbd-mirror.${cluster}_daemon.\$cluster.\$pid.log \
 	--admin-socket=${TEMPDIR}/rbd-mirror.${cluster}_daemon.\$cluster.asok \
+	--rbd-mirror-journal-poll-age=1 \
 	--debug-rbd=30 --debug-journaler=30 \
 	--debug-rbd_mirror=30 \
 	--daemonize=true
@@ -395,7 +418,7 @@ get_position()
     local status_log=${TEMPDIR}/${CLUSTER2}-${pool}-${image}.status
     rbd --cluster ${cluster} -p ${pool} journal status --image ${image} |
 	tee ${status_log} >&2
-    sed -nEe 's/^.*\[id='"${id_regexp}"',.*positions=\[\[([^]]*)\],.*$/\1/p' \
+    sed -nEe 's/^.*\[id='"${id_regexp}"',.*positions=\[\[([^]]*)\],.*state=connected.*$/\1/p' \
 	${status_log}
 }
 
@@ -459,19 +482,51 @@ test_status_in_pool_dir()
 
     local status_log=${TEMPDIR}/${cluster}-${image}.mirror_status
     rbd --cluster ${cluster} -p ${pool} mirror image status ${image} |
-	tee ${status_log}
+	tee ${status_log} >&2
     grep "state: .*${state_pattern}" ${status_log}
     grep "description: .*${description_pattern}" ${status_log}
 }
 
-create_image()
+wait_for_status_in_pool_dir()
 {
     local cluster=$1
     local pool=$2
     local image=$3
+    local state_pattern=$4
+    local description_pattern=$5
 
-    rbd --cluster ${cluster} -p ${pool} create --size 128 \
-	--image-feature layering,exclusive-lock,journaling ${image}
+    for s in 1 2 4 8 8 8 8 8 8 8 8 16 16; do
+	sleep ${s}
+	test_status_in_pool_dir ${cluster} ${pool} ${image} ${state_pattern} ${description_pattern} && return 0
+    done
+    return 1
+}
+
+create_image()
+{
+    local cluster=$1 ; shift
+    local pool=$1 ; shift
+    local image=$1 ; shift
+    local size=128
+
+    if [ -n "$1" ]; then
+	size=$1
+	shift
+    fi
+
+    rbd --cluster ${cluster} -p ${pool} create --size ${size} \
+	--image-feature layering,exclusive-lock,journaling $@ ${image}
+}
+
+set_image_meta()
+{
+    local cluster=$1
+    local pool=$2
+    local image=$3
+    local key=$4
+    local val=$5
+
+    rbd --cluster ${cluster} -p ${pool} image-meta set ${image} $key $val
 }
 
 remove_image()
@@ -480,6 +535,7 @@ remove_image()
     local pool=$2
     local image=$3
 
+    rbd --cluster=${cluster} -p ${pool} snap purge ${image}
     rbd --cluster=${cluster} -p ${pool} rm ${image}
 }
 
@@ -509,6 +565,16 @@ clone_image()
 	${clone_pool}/${clone_image} --image-feature layering,exclusive-lock,journaling
 }
 
+disconnect_image()
+{
+    local cluster=$1
+    local pool=$2
+    local image=$3
+
+    rbd --cluster ${cluster} -p ${pool} journal client disconnect \
+	--image ${image}
+}
+
 create_snapshot()
 {
     local cluster=$1
@@ -527,6 +593,17 @@ remove_snapshot()
     local snap=$4
 
     rbd --cluster ${cluster} -p ${pool} snap rm ${image}@${snap}
+}
+
+rename_snapshot()
+{
+    local cluster=$1
+    local pool=$2
+    local image=$3
+    local snap=$4
+    local new_snap=$5
+
+    rbd --cluster ${cluster} -p ${pool} snap rename ${image}@${snap} ${image}@${new_snap}
 }
 
 purge_snapshots()
@@ -580,9 +657,12 @@ write_image()
     local pool=$2
     local image=$3
     local count=$4
+    local size=$5
+
+    test -n "${size}" || size=4096
 
     rbd --cluster ${cluster} -p ${pool} bench-write ${image} \
-	--io-size 4096 --io-threads 1 --io-total $((4096 * count)) \
+	--io-size ${size} --io-threads 1 --io-total $((size * count)) \
 	--io-pattern rand
 }
 
@@ -591,7 +671,7 @@ stress_write_image()
     local cluster=$1
     local pool=$2
     local image=$3
-    local duration=$(awk 'BEGIN {srand(); print int(35 * rand()) + 15}')
+    local duration=$(awk 'BEGIN {srand(); print int(10 * rand()) + 5}')
 
     timeout ${duration}s ceph_test_rbd_mirror_random_write \
 	--cluster ${cluster} ${pool} ${image} \
@@ -628,8 +708,9 @@ promote_image()
     local cluster=$1
     local pool=$2
     local image=$3
+    local force=$4
 
-    rbd --cluster=${cluster} mirror image promote ${pool}/${image}
+    rbd --cluster=${cluster} mirror image promote ${pool}/${image} ${force}
 }
 
 set_pool_mirror_mode()

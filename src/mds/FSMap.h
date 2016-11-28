@@ -263,14 +263,17 @@ public:
    */
   void promote(
       mds_gid_t standby_gid,
-      std::shared_ptr<Filesystem> filesystem,
+      const std::shared_ptr<Filesystem> &filesystem,
       mds_rank_t assigned_rank);
 
   /**
    * A daemon reports that it is STATE_STOPPED: remove it,
    * and the rank it held.
+   *
+   * @returns a list of any additional GIDs that were removed from the map
+   * as a side effect (like standby replays)
    */
-  void stop(mds_gid_t who);
+  std::list<mds_gid_t> stop(mds_gid_t who);
 
   /**
    * The rank held by 'who', if any, is to be relinquished, and
@@ -311,7 +314,9 @@ public:
       std::function<void(MDSMap::mds_info_t *info)> fn)
   {
     if (mds_roles.at(who) == FS_CLUSTER_ID_NONE) {
-      fn(&standby_daemons.at(who));
+      auto &info = standby_daemons.at(who);
+      fn(&info);
+      assert(info.state == MDSMap::STATE_STANDBY);
       standby_epochs[who] = epoch;
     } else {
       auto fs = filesystems[mds_roles.at(who)];
@@ -375,20 +380,21 @@ public:
     });
   }
 
-  const std::map<fs_cluster_id_t, std::shared_ptr<Filesystem> > &get_filesystems() const
-  {
-    return filesystems;
-  }
-  bool any_filesystems() const {return !filesystems.empty(); }
-  bool filesystem_exists(fs_cluster_id_t fscid) const
-    {return filesystems.count(fscid) > 0;}
-
   epoch_t get_epoch() const { return epoch; }
   void inc_epoch() { epoch++; }
 
-  std::shared_ptr<const Filesystem> get_filesystem(fs_cluster_id_t fscid) const
+  size_t filesystem_count() const {return filesystems.size();}
+  bool filesystem_exists(fs_cluster_id_t fscid) const {return filesystems.count(fscid) > 0;}
+  std::shared_ptr<const Filesystem> get_filesystem(fs_cluster_id_t fscid) const {return std::const_pointer_cast<const Filesystem>(filesystems.at(fscid));}
+  std::shared_ptr<const Filesystem> get_filesystem(void) const {return std::const_pointer_cast<const Filesystem>(filesystems.begin()->second);}
+  std::shared_ptr<const Filesystem> get_filesystem(const std::string &name) const
   {
-    return std::const_pointer_cast<const Filesystem>(filesystems.at(fscid));
+    for (auto &i : filesystems) {
+      if (i.second->mds_map.fs_name == name) {
+        return std::const_pointer_cast<const Filesystem>(i.second);
+      }
+    }
+    return nullptr;
   }
 
   int parse_filesystem(
@@ -423,17 +429,6 @@ public:
 
   void get_health(list<pair<health_status_t,std::string> >& summary,
 		  list<pair<health_status_t,std::string> > *detail) const;
-
-  std::shared_ptr<const Filesystem> get_filesystem(const std::string &name) const
-  {
-    for (auto &i : filesystems) {
-      if (i.second->mds_map.fs_name == name) {
-        return i.second;
-      }
-    }
-
-    return nullptr;
-  }
 
   /**
    * Assert that the FSMap, Filesystem, MDSMap, mds_info_t relations are

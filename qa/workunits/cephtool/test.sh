@@ -33,10 +33,10 @@ function expect_false()
 }
 
 
-TEMP_DIR=$(mktemp -d cephtool.XXX)
+TEMP_DIR=$(mktemp -d ${TMPDIR-/tmp}/cephtool.XXX)
 trap "rm -fr $TEMP_DIR" 0
 
-TMPFILE=$(mktemp -p $TEMP_DIR test_invalid.XXX)
+TMPFILE=$(mktemp $TEMP_DIR/test_invalid.XXX)
 
 #
 # retry_eagain max cmd args ...
@@ -149,7 +149,7 @@ function ceph_watch_start()
 	whatch_opt=--watch-$1
     fi
 
-    CEPH_WATCH_FILE=${TMPDIR}/CEPH_WATCH_$$
+    CEPH_WATCH_FILE=${TEMP_DIR}/CEPH_WATCH_$$
     ceph $whatch_opt > $CEPH_WATCH_FILE &
     CEPH_WATCH_PID=$!
 
@@ -1109,6 +1109,8 @@ function test_mon_osd()
   expect_false ceph osd unset bogus
   ceph osd set require_jewel_osds
   expect_false ceph osd unset require_jewel_osds
+  ceph osd set require_kraken_osds
+  expect_false ceph osd unset require_kraken_osds
 
   ceph osd set noup
   ceph osd down 0
@@ -1131,9 +1133,9 @@ function test_mon_osd()
   # ceph osd find expects the OsdName, so both ints and osd.n should work.
   ceph osd find 1
   ceph osd find osd.1
-  expect_false osd find osd.xyz
-  expect_false osd find xyz
-  expect_false osd find 0.1
+  expect_false ceph osd find osd.xyz
+  expect_false ceph osd find xyz
+  expect_false ceph osd find 0.1
   ceph --format plain osd find 1 # falls back to json-pretty
   ceph osd metadata 1 | grep 'distro'
   ceph --format plain osd metadata 1 | grep 'distro' # falls back to json-pretty
@@ -1249,7 +1251,7 @@ function test_mon_osd()
   ceph osd pool delete data data --yes-i-really-really-mean-it
 
   ceph osd pause
-  ceph osd dump | grep 'flags pauserd,pausewr'
+  ceph osd dump | grep 'flags.*pauserd,pausewr'
   ceph osd unpause
 
   ceph osd tree
@@ -1512,6 +1514,15 @@ function test_mon_osd_pool_set()
   wait_for_clean
   ceph osd pool set $TEST_POOL_GETSET pgp_num 10
 
+  old_pgs=$(ceph osd pool get $TEST_POOL_GETSET pg_num | sed -e 's/pg_num: //')
+  new_pgs=$(($old_pgs+$(ceph osd stat | grep osdmap | awk '{print $3}')*32))
+  ceph osd pool set $TEST_POOL_GETSET pg_num $new_pgs
+  ceph osd pool set $TEST_POOL_GETSET pgp_num $new_pgs
+  wait_for_clean
+  old_pgs=$(ceph osd pool get $TEST_POOL_GETSET pg_num | sed -e 's/pg_num: //')
+  new_pgs=$(($old_pgs+$(ceph osd stat | grep osdmap | awk '{print $3}')*32+1))
+  expect_false ceph osd pool set $TEST_POOL_GETSET pg_num $new_pgs
+
   ceph osd pool set $TEST_POOL_GETSET nosizechange 1
   expect_false ceph osd pool set $TEST_POOL_GETSET size 2
   expect_false ceph osd pool set $TEST_POOL_GETSET min_size 2
@@ -1760,7 +1771,7 @@ function test_mon_crushmap_validation()
   local map=$TEMP_DIR/map
   ceph osd getcrushmap -o $map
 
-  local crushtool_path="${TMPDIR}/crushtool"
+  local crushtool_path="${TEMP_DIR}/crushtool"
   touch "${crushtool_path}"
   chmod +x "${crushtool_path}"
   local crushtool_path_old=`ceph-conf --show-config-value crushtool`

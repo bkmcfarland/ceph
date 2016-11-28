@@ -77,6 +77,120 @@ PGLSFilter::~PGLSFilter()
 {
 }
 
+struct ReplicatedPG::C_OSD_OnApplied : Context {
+  ReplicatedPGRef pg;
+  epoch_t epoch;
+  eversion_t v;
+  C_OSD_OnApplied(
+    ReplicatedPGRef pg,
+    epoch_t epoch,
+    eversion_t v)
+    : pg(pg), epoch(epoch), v(v) {}
+  void finish(int) override {
+    pg->lock();
+    if (!pg->pg_has_reset_since(epoch))
+      pg->op_applied(v);
+    pg->unlock();
+  }
+};
+
+/**
+ * The CopyCallback class defines an interface for completions to the
+ * copy_start code. Users of the copy infrastructure must implement
+ * one and give an instance of the class to start_copy.
+ *
+ * The implementer is responsible for making sure that the CopyCallback
+ * can associate itself with the correct copy operation.
+ */
+class ReplicatedPG::CopyCallback : public GenContext<CopyCallbackResults> {
+protected:
+  CopyCallback() {}
+  /**
+   * results.get<0>() is the return code: 0 for success; -ECANCELED if
+   * the operation was cancelled by the local OSD; -errno for other issues.
+   * results.get<1>() is a pointer to a CopyResults object, which you are
+   * responsible for deleting.
+   */
+  virtual void finish(CopyCallbackResults results_) = 0;
+
+public:
+  /// Provide the final size of the copied object to the CopyCallback
+  virtual ~CopyCallback() {}
+};
+
+template <typename T>
+class ReplicatedPG::BlessedGenContext : public GenContext<T> {
+  ReplicatedPGRef pg;
+  GenContext<T> *c;
+  epoch_t e;
+public:
+  BlessedGenContext(ReplicatedPG *pg, GenContext<T> *c, epoch_t e)
+    : pg(pg), c(c), e(e) {}
+  void finish(T t) {
+    pg->lock();
+    if (pg->pg_has_reset_since(e))
+      delete c;
+    else
+      c->complete(t);
+    pg->unlock();
+  }
+};
+
+GenContext<ThreadPool::TPHandle&> *ReplicatedPG::bless_gencontext(
+  GenContext<ThreadPool::TPHandle&> *c) {
+  return new BlessedGenContext<ThreadPool::TPHandle&>(
+    this, c, get_osdmap()->get_epoch());
+}
+
+class ReplicatedPG::BlessedContext : public Context {
+  ReplicatedPGRef pg;
+  Context *c;
+  epoch_t e;
+public:
+  BlessedContext(ReplicatedPG *pg, Context *c, epoch_t e)
+    : pg(pg), c(c), e(e) {}
+  void finish(int r) {
+    pg->lock();
+    if (pg->pg_has_reset_since(e))
+      delete c;
+    else
+      c->complete(r);
+    pg->unlock();
+  }
+};
+
+
+Context *ReplicatedPG::bless_context(Context *c) {
+  return new BlessedContext(this, c, get_osdmap()->get_epoch());
+}
+
+class ReplicatedPG::C_PG_ObjectContext : public Context {
+  ReplicatedPGRef pg;
+  ObjectContext *obc;
+  public:
+  C_PG_ObjectContext(ReplicatedPG *p, ObjectContext *o) :
+    pg(p), obc(o) {}
+  void finish(int r) {
+    pg->object_context_destructor_callback(obc);
+  }
+};
+
+class ReplicatedPG::C_OSD_OndiskWriteUnlock : public Context {
+  ObjectContextRef obc, obc2, obc3;
+  public:
+  C_OSD_OndiskWriteUnlock(
+    ObjectContextRef o,
+    ObjectContextRef o2 = ObjectContextRef(),
+    ObjectContextRef o3 = ObjectContextRef()) : obc(o), obc2(o2), obc3(o3) {}
+  void finish(int r) {
+    obc->ondisk_write_unlock();
+    if (obc2)
+      obc2->ondisk_write_unlock();
+    if (obc3)
+      obc3->ondisk_write_unlock();
+  }
+};
+
 struct OnReadComplete : public Context {
   ReplicatedPG *pg;
   ReplicatedPG::OpContext *opcontext;
@@ -89,6 +203,41 @@ struct OnReadComplete : public Context {
     opcontext->finish_read(pg);
   }
   ~OnReadComplete() {}
+};
+
+class ReplicatedPG::C_OSD_AppliedRecoveredObject : public Context {
+  ReplicatedPGRef pg;
+  ObjectContextRef obc;
+  public:
+  C_OSD_AppliedRecoveredObject(ReplicatedPG *p, ObjectContextRef o) :
+    pg(p), obc(o) {}
+  void finish(int r) {
+    pg->_applied_recovered_object(obc);
+  }
+};
+
+class ReplicatedPG::C_OSD_CommittedPushedObject : public Context {
+  ReplicatedPGRef pg;
+  epoch_t epoch;
+  eversion_t last_complete;
+  public:
+  C_OSD_CommittedPushedObject(
+    ReplicatedPG *p, epoch_t epoch, eversion_t lc) :
+    pg(p), epoch(epoch), last_complete(lc) {
+  }
+  void finish(int r) {
+    pg->_committed_pushed_object(epoch, last_complete);
+  }
+};
+
+class ReplicatedPG::C_OSD_AppliedRecoveredObjectReplica : public Context {
+  ReplicatedPGRef pg;
+  public:
+  explicit C_OSD_AppliedRecoveredObjectReplica(ReplicatedPG *p) :
+    pg(p) {}
+  void finish(int r) {
+    pg->_applied_recovered_object_replica();
+  }
 };
 
 // OpContext
@@ -186,7 +335,7 @@ void ReplicatedPG::on_local_recover(
   }
 
   if (pg_log.get_missing().is_missing(recovery_info.soid) &&
-      pg_log.get_missing().missing.find(recovery_info.soid)->second.need > recovery_info.version) {
+      pg_log.get_missing().get_items().find(recovery_info.soid)->second.need > recovery_info.version) {
     assert(is_primary());
     const pg_log_entry_t *latest = pg_log.get_log().objects.find(recovery_info.soid)->second;
     if (latest->op == pg_log_entry_t::LOST_REVERT &&
@@ -230,13 +379,15 @@ void ReplicatedPG::on_local_recover(
     publish_stats_to_osd();
     assert(missing_loc.needs_recovery(hoid));
     missing_loc.add_location(hoid, pg_whoami);
-    if (!is_unreadable_object(hoid) &&
-        waiting_for_unreadable_object.count(hoid)) {
-      dout(20) << " kicking unreadable waiters on " << hoid << dendl;
-      requeue_ops(waiting_for_unreadable_object[hoid]);
-      waiting_for_unreadable_object.erase(hoid);
+    if (!is_unreadable_object(hoid)) {
+      auto unreadable_object_entry = waiting_for_unreadable_object.find(hoid);
+      if (unreadable_object_entry != waiting_for_unreadable_object.end()) {
+	dout(20) << " kicking unreadable waiters on " << hoid << dendl;
+	requeue_ops(unreadable_object_entry->second);
+	waiting_for_unreadable_object.erase(unreadable_object_entry);
+      }
     }
-    if (pg_log.get_missing().missing.size() == 0) {
+    if (pg_log.get_missing().get_items().size() == 0) {
       requeue_ops(waiting_for_all_missing);
       waiting_for_all_missing.clear();
     }
@@ -276,20 +427,21 @@ void ReplicatedPG::on_global_recover(
   i->second->drop_recovery_read(&requeue_list);
   requeue_ops(requeue_list);
 
-  if (backfills_in_flight.count(soid))
-    backfills_in_flight.erase(soid);
+  backfills_in_flight.erase(soid);
 
   recovering.erase(i);
   finish_recovery_op(soid);
-  if (waiting_for_degraded_object.count(soid)) {
+  auto degraded_object_entry = waiting_for_degraded_object.find(soid);
+  if (degraded_object_entry != waiting_for_degraded_object.end()) {
     dout(20) << " kicking degraded waiters on " << soid << dendl;
-    requeue_ops(waiting_for_degraded_object[soid]);
-    waiting_for_degraded_object.erase(soid);
+    requeue_ops(degraded_object_entry->second);
+    waiting_for_degraded_object.erase(degraded_object_entry);
   }
-  if (waiting_for_unreadable_object.count(soid)) {
+  auto unreadable_object_entry = waiting_for_unreadable_object.find(soid);
+  if (unreadable_object_entry != waiting_for_unreadable_object.end()) {
     dout(20) << " kicking unreadable waiters on " << soid << dendl;
-    requeue_ops(waiting_for_unreadable_object[soid]);
-    waiting_for_unreadable_object.erase(soid);
+    requeue_ops(unreadable_object_entry->second);
+    waiting_for_unreadable_object.erase(unreadable_object_entry);
   }
   finish_degraded_object(soid);
 }
@@ -354,7 +506,7 @@ PerfCounters *ReplicatedPG::get_logger()
 
 bool ReplicatedPG::is_missing_object(const hobject_t& soid) const
 {
-  return pg_log.get_missing().missing.count(soid);
+  return pg_log.get_missing().get_items().count(soid);
 }
 
 void ReplicatedPG::maybe_kick_recovery(
@@ -405,7 +557,7 @@ bool ReplicatedPG::is_degraded_or_backfilling_object(const hobject_t& soid)
    */
   if (waiting_for_degraded_object.count(soid))
     return true;
-  if (pg_log.get_missing().missing.count(soid))
+  if (pg_log.get_missing().get_items().count(soid))
     return true;
   assert(!actingbackfill.empty());
   for (set<pg_shard_t>::iterator i = actingbackfill.begin();
@@ -414,7 +566,7 @@ bool ReplicatedPG::is_degraded_or_backfilling_object(const hobject_t& soid)
     if (*i == get_primary()) continue;
     pg_shard_t peer = *i;
     if (peer_missing.count(peer) &&
-	peer_missing[peer].missing.count(soid))
+	peer_missing[peer].get_items().count(soid))
       return true;
 
     // Object is degraded if after last_backfill AND
@@ -629,7 +781,9 @@ int ReplicatedPG::get_pgls_filter(bufferlist::iterator& iter, PGLSFilter **pfilt
     if (r != 0) {
       derr << "Error opening class '" << class_name << "': "
            << cpp_strerror(r) << dendl;
-      return -EINVAL;
+      if (r != -EPERM) // propogate permission error
+        r = -EINVAL;
+      return r;
     } else {
       assert(cls);
     }
@@ -803,9 +957,9 @@ int ReplicatedPG::do_command(
     }
     f->dump_int("num_missing", missing.num_missing());
     f->dump_int("num_unfound", get_num_unfound());
-    const map<hobject_t, pg_missing_t::item, hobject_t::BitwiseComparator> &needs_recovery_map =
+    const map<hobject_t, pg_missing_item, hobject_t::BitwiseComparator> &needs_recovery_map =
       missing_loc.get_needs_recovery();
-    map<hobject_t, pg_missing_t::item, hobject_t::BitwiseComparator>::const_iterator p =
+    map<hobject_t, pg_missing_item, hobject_t::BitwiseComparator>::const_iterator p =
       needs_recovery_map.upper_bound(offset);
     {
       f->open_array_section("objects");
@@ -848,7 +1002,7 @@ int ReplicatedPG::do_command(
 
 bool ReplicatedPG::pg_op_must_wait(MOSDOp *op)
 {
-  if (pg_log.get_missing().missing.empty())
+  if (pg_log.get_missing().get_items().empty())
     return false;
   for (vector<OSDOp>::iterator p = op->ops.begin(); p != op->ops.end(); ++p) {
     if (p->op.op == CEPH_OSD_OP_PGLS || p->op.op == CEPH_OSD_OP_PGNLS ||
@@ -957,18 +1111,18 @@ void ReplicatedPG::do_pg_op(OpRequestRef op)
 	  break;
 	}
 
-	assert(snapid == CEPH_NOSNAP || pg_log.get_missing().missing.empty());
+	assert(snapid == CEPH_NOSNAP || pg_log.get_missing().get_items().empty());
 
 	// ensure sort order is correct
 	pg_log.resort_missing(get_sort_bitwise());
 
-	map<hobject_t, pg_missing_t::item, hobject_t::ComparatorWithDefault>::const_iterator missing_iter =
-	  pg_log.get_missing().missing.lower_bound(current);
+	map<hobject_t, pg_missing_item, hobject_t::ComparatorWithDefault>::const_iterator missing_iter =
+	  pg_log.get_missing().get_items().lower_bound(current);
 	vector<hobject_t>::iterator ls_iter = sentries.begin();
 	hobject_t _max = hobject_t::get_max();
 	while (1) {
 	  const hobject_t &mcand =
-	    missing_iter == pg_log.get_missing().missing.end() ?
+	    missing_iter == pg_log.get_missing().get_items().end() ?
 	    _max :
 	    missing_iter->first;
 	  const hobject_t &lcand =
@@ -1061,7 +1215,7 @@ void ReplicatedPG::do_pg_op(OpRequestRef op)
 	}
 
 	if (next.is_max() &&
-	    missing_iter == pg_log.get_missing().missing.end() &&
+	    missing_iter == pg_log.get_missing().get_items().end() &&
 	    ls_iter == sentries.end()) {
 	  result = 1;
 
@@ -1144,18 +1298,18 @@ void ReplicatedPG::do_pg_op(OpRequestRef op)
 	  break;
 	}
 
-	assert(snapid == CEPH_NOSNAP || pg_log.get_missing().missing.empty());
+	assert(snapid == CEPH_NOSNAP || pg_log.get_missing().get_items().empty());
 
 	// ensure sort order is correct
 	pg_log.resort_missing(get_sort_bitwise());
 
-	map<hobject_t, pg_missing_t::item, hobject_t::ComparatorWithDefault>::const_iterator missing_iter =
-	  pg_log.get_missing().missing.lower_bound(current);
+	map<hobject_t, pg_missing_item, hobject_t::ComparatorWithDefault>::const_iterator missing_iter =
+	  pg_log.get_missing().get_items().lower_bound(current);
 	vector<hobject_t>::iterator ls_iter = sentries.begin();
 	hobject_t _max = hobject_t::get_max();
 	while (1) {
 	  const hobject_t &mcand =
-	    missing_iter == pg_log.get_missing().missing.end() ?
+	    missing_iter == pg_log.get_missing().get_items().end() ?
 	    _max :
 	    missing_iter->first;
 	  const hobject_t &lcand =
@@ -1230,7 +1384,7 @@ void ReplicatedPG::do_pg_op(OpRequestRef op)
 					       candidate.get_key()));
 	}
 	if (next.is_max() &&
-	    missing_iter == pg_log.get_missing().missing.end() &&
+	    missing_iter == pg_log.get_missing().get_items().end() &&
 	    ls_iter == sentries.end()) {
 	  result = 1;
 	}
@@ -2175,7 +2329,9 @@ void ReplicatedPG::record_write_error(OpRequestRef op, const hobject_t &soid,
 	dout(10) << " sending commit on " << *m << " " << reply << dendl;
 	osd->send_message_osd_client(reply, m->get_connection());
       }
-      ));
+      ),
+    op
+  );
 }
 
 ReplicatedPG::cache_result_t ReplicatedPG::maybe_handle_cache_detail(
@@ -8617,12 +8773,14 @@ ReplicatedPG::RepGather *ReplicatedPG::new_repop(
   return repop;
 }
 
-ReplicatedPG::RepGather *ReplicatedPG::new_repop(
+boost::intrusive_ptr<ReplicatedPG::RepGather> ReplicatedPG::new_repop(
   ObcLockManager &&manager,
+  OpRequestRef &&op,
   boost::optional<std::function<void(void)> > &&on_complete)
 {
   RepGather *repop = new RepGather(
     std::move(manager),
+    std::move(op),
     std::move(on_complete),
     osd->get_tid(),
     info.last_complete);
@@ -8630,11 +8788,10 @@ ReplicatedPG::RepGather *ReplicatedPG::new_repop(
   repop->start = ceph_clock_now(cct);
 
   repop_queue.push_back(&repop->queue_item);
-  repop->get();
 
   osd->logger->inc(l_osd_op_wip);
 
-  return repop;
+  return boost::intrusive_ptr<RepGather>(repop);
 }
  
 void ReplicatedPG::remove_repop(RepGather *repop)
@@ -8679,9 +8836,10 @@ void ReplicatedPG::simple_opc_submit(OpContextUPtr ctx)
 void ReplicatedPG::submit_log_entries(
   const list<pg_log_entry_t> &entries,
   ObcLockManager &&manager,
-  boost::optional<std::function<void(void)> > &&on_complete)
+  boost::optional<std::function<void(void)> > &&on_complete,
+  OpRequestRef op)
 {
-  dout(10) << __func__ << entries << dendl;
+  dout(10) << __func__ << " " << entries << dendl;
   assert(is_primary());
 
   ObjectStore::Transaction t;
@@ -8694,6 +8852,7 @@ void ReplicatedPG::submit_log_entries(
   if (get_osdmap()->test_flag(CEPH_OSDMAP_REQUIRE_JEWEL)) {
     repop = new_repop(
       std::move(manager),
+      std::move(op),
       std::move(on_complete));
   }
   for (set<pg_shard_t>::const_iterator i = actingbackfill.begin();
@@ -9490,7 +9649,7 @@ int ReplicatedPG::recover_missing(
 	return PULL_NONE;
       } else {
 	int r = recover_missing(
-	  head, pg_log.get_missing().missing.find(head)->second.need, priority,
+	  head, pg_log.get_missing().get_items().find(head)->second.need, priority,
 	  h);
 	if (r != PULL_NONE)
 	  return PULL_OTHER;
@@ -9504,7 +9663,7 @@ int ReplicatedPG::recover_missing(
 	return PULL_NONE;
       } else {
 	int r = recover_missing(
-	  head, pg_log.get_missing().missing.find(head)->second.need, priority,
+	  head, pg_log.get_missing().get_items().find(head)->second.need, priority,
 	  h);
 	if (r != PULL_NONE)
 	  return PULL_OTHER;
@@ -9674,13 +9833,13 @@ void ReplicatedPG::recover_got(hobject_t oid, eversion_t v)
   }
 }
 
-
-void ReplicatedPG::failed_push(pg_shard_t from, const hobject_t &soid)
+void ReplicatedPG::failed_push(const list<pg_shard_t> &from, const hobject_t &soid)
 {
   assert(recovering.count(soid));
   recovering.erase(soid);
-  missing_loc.remove_location(soid, from);
-  dout(0) << "_failed_push " << soid << " from shard " << from
+  for (auto&& i : from)
+    missing_loc.remove_location(soid, i);
+  dout(0) << __func__ << " " << soid << " from shard " << from
 	  << ", reps on " << missing_loc.get_locations(soid)
 	  << " unfound? " << missing_loc.is_unfound(soid) << dendl;
   finish_recovery_op(soid);  // close out this attempt,
@@ -9705,7 +9864,7 @@ eversion_t ReplicatedPG::pick_newest_available(const hobject_t& oid)
   eversion_t v;
 
   assert(pg_log.get_missing().is_missing(oid));
-  v = pg_log.get_missing().missing.find(oid)->second.have;
+  v = pg_log.get_missing().get_items().find(oid)->second.have;
   dout(10) << "pick_newest_available " << oid << " " << v << " on osd." << osd->whoami << " (local)" << dendl;
 
   assert(!actingbackfill.empty());
@@ -9718,7 +9877,7 @@ eversion_t ReplicatedPG::pick_newest_available(const hobject_t& oid)
       assert(is_backfill_targets(peer));
       continue;
     }
-    eversion_t h = peer_missing[peer].missing[oid].have;
+    eversion_t h = peer_missing[peer].get_items().at(oid).have;
     dout(10) << "pick_newest_available " << oid << " " << h << " on osd." << peer << dendl;
     if (h > v)
       v = h;
@@ -9815,9 +9974,9 @@ void ReplicatedPG::mark_all_unfound_lost(
   list<pg_log_entry_t> log_entries;
 
   utime_t mtime = ceph_clock_now(cct);
-  map<hobject_t, pg_missing_t::item, hobject_t::ComparatorWithDefault>::const_iterator m =
+  map<hobject_t, pg_missing_item, hobject_t::ComparatorWithDefault>::const_iterator m =
     missing_loc.get_needs_recovery().begin();
-  map<hobject_t, pg_missing_t::item, hobject_t::ComparatorWithDefault>::const_iterator mend =
+  map<hobject_t, pg_missing_item, hobject_t::ComparatorWithDefault>::const_iterator mend =
     missing_loc.get_needs_recovery().end();
 
   ObcLockManager manager;
@@ -9891,6 +10050,7 @@ void ReplicatedPG::mark_all_unfound_lost(
       [=]() {
 	requeue_ops(waiting_for_all_missing);
 	waiting_for_all_missing.clear();
+	requeue_object_waiters(waiting_for_unreadable_object);
 	queue_recovery();
 
 	stringstream ss;
@@ -10004,6 +10164,7 @@ void ReplicatedPG::on_removal(ObjectStore::Transaction *t)
 
   // adjust info to backfill
   info.set_last_backfill(hobject_t(), true);
+  pg_log.reset_backfill();
   dirty_info = true;
 
 
@@ -10191,6 +10352,7 @@ void ReplicatedPG::on_change(ObjectStore::Transaction *t)
   // this will requeue ops we were working on but didn't finish, and
   // any dups
   apply_and_flush_repops(is_primary());
+  cancel_log_updates();
 
   // do this *after* apply_and_flush_repops so that we catch any newly
   // registered watches.
@@ -10274,7 +10436,7 @@ void ReplicatedPG::_clear_recovery_state()
 
 void ReplicatedPG::cancel_pull(const hobject_t &soid)
 {
-  dout(20) << __func__ << ": soid" << dendl;
+  dout(20) << __func__ << ": " << soid << dendl;
   assert(recovering.count(soid));
   ObjectContextRef obc = recovering[soid];
   if (obc) {
@@ -10299,7 +10461,7 @@ void ReplicatedPG::cancel_pull(const hobject_t &soid)
   finish_degraded_object(soid);
 }
 
-void ReplicatedPG::check_recovery_sources(const OSDMapRef osdmap)
+void ReplicatedPG::check_recovery_sources(const OSDMapRef& osdmap)
 {
   /*
    * check that any peers we are planning to (or currently) pulling
@@ -10331,7 +10493,7 @@ void ReplicatedPG::check_recovery_sources(const OSDMapRef osdmap)
   }
 }
 
-void PG::MissingLoc::check_recovery_sources(const OSDMapRef osdmap)
+void PG::MissingLoc::check_recovery_sources(const OSDMapRef& osdmap)
 {
   set<pg_shard_t> now_down;
   for (set<pg_shard_t>::iterator p = missing_loc_sources.begin();
@@ -10471,7 +10633,7 @@ bool ReplicatedPG::start_recovery_ops(
   if (missing.num_missing() > 0) {
     // this shouldn't happen!
     osd->clog->error() << info.pgid << " recovery ending with " << missing.num_missing()
-		      << ": " << missing.missing << "\n";
+		       << ": " << missing.get_items() << "\n";
     return work_in_progress;
   }
 
@@ -10528,7 +10690,7 @@ uint64_t ReplicatedPG::recover_primary(uint64_t max, ThreadPool::TPHandle &handl
   dout(10) << "recover_primary recovering " << recovering.size()
 	   << " in pg" << dendl;
   dout(10) << "recover_primary " << missing << dendl;
-  dout(25) << "recover_primary " << missing.missing << dendl;
+  dout(25) << "recover_primary " << missing.get_items() << dendl;
 
   // look at log!
   pg_log_entry_t *latest = 0;
@@ -10537,8 +10699,8 @@ uint64_t ReplicatedPG::recover_primary(uint64_t max, ThreadPool::TPHandle &handl
 
   PGBackend::RecoveryHandle *h = pgbackend->open_recovery_op();
   map<version_t, hobject_t>::const_iterator p =
-    missing.rmissing.lower_bound(pg_log.get_log().last_requested);
-  while (p != missing.rmissing.end()) {
+    missing.get_rmissing().lower_bound(pg_log.get_log().last_requested);
+  while (p != missing.get_rmissing().end()) {
     handle.reset_tp_timeout();
     hobject_t soid;
     version_t v = p->first;
@@ -10551,7 +10713,7 @@ uint64_t ReplicatedPG::recover_primary(uint64_t max, ThreadPool::TPHandle &handl
       latest = 0;
       soid = p->second;
     }
-    const pg_missing_t::item& item = missing.missing.find(p->second)->second;
+    const pg_missing_item& item = missing.get_items().find(p->second)->second;
     ++p;
 
     hobject_t head = soid;
@@ -10629,7 +10791,7 @@ uint64_t ReplicatedPG::recover_primary(uint64_t max, ThreadPool::TPHandle &handl
 		 p != peer_missing.end();
 		 ++p)
 	      if (p->second.is_missing(soid, need) &&
-		  p->second.missing[soid].have == alternate_need) {
+		  p->second.get_items().at(soid).have == alternate_need) {
 		missing_loc.add_location(soid, p->first);
 	      }
 	    dout(10) << " will pull " << alternate_need << " or " << need
@@ -10758,12 +10920,12 @@ uint64_t ReplicatedPG::recover_replicas(uint64_t max, ThreadPool::TPHandle &hand
     size_t m_sz = pm->second.num_missing();
 
     dout(10) << " peer osd." << peer << " missing " << m_sz << " objects." << dendl;
-    dout(20) << " peer osd." << peer << " missing " << pm->second.missing << dendl;
+    dout(20) << " peer osd." << peer << " missing " << pm->second.get_items() << dendl;
 
     // oldest first!
     const pg_missing_t &m(pm->second);
-    for (map<version_t, hobject_t>::const_iterator p = m.rmissing.begin();
-	   p != m.rmissing.end() && started < max;
+    for (map<version_t, hobject_t>::const_iterator p = m.get_rmissing().begin();
+	 p != m.get_rmissing().end() && started < max;
 	   ++p) {
       handle.reset_tp_timeout();
       const hobject_t soid(p->second);
@@ -10805,7 +10967,7 @@ uint64_t ReplicatedPG::recover_replicas(uint64_t max, ThreadPool::TPHandle &hand
       }
 
       dout(10) << __func__ << ": recover_object_replicas(" << soid << ")" << dendl;
-      map<hobject_t,pg_missing_t::item, hobject_t::ComparatorWithDefault>::const_iterator r = m.missing.find(soid);
+      map<hobject_t,pg_missing_item, hobject_t::ComparatorWithDefault>::const_iterator r = m.get_items().find(soid);
       started += prep_object_replica_pushes(soid, r->second.need,
 					    h);
     }
@@ -12622,11 +12784,11 @@ unsigned ReplicatedPG::process_clones_to(const boost::optional<hobject_t> &head,
  *              [Snapset clones 4]
  * EOL                  obj4 snap 4, (expected)
  */
-void ReplicatedPG::_scrub(
+void ReplicatedPG::scrub_snapshot_metadata(
   ScrubMap &scrubmap,
   const map<hobject_t, pair<uint32_t, uint32_t>, hobject_t::BitwiseComparator> &missing_digest)
 {
-  dout(10) << "_scrub" << dendl;
+  dout(10) << __func__ << dendl;
 
   coll_t c(info.pgid);
   bool repair = state_test(PG_STATE_REPAIR);
@@ -12763,7 +12925,8 @@ void ReplicatedPG::_scrub(
       ++scrubber.shallow_errors;
       soid_error.set_headless();
       scrubber.store->add_snap_error(pool.id, soid_error);
-      head_error.set_clone(soid.snap);
+      if (head && soid.get_head() == head->get_head())
+	head_error.set_clone(soid.snap);
       continue;
     }
 
@@ -12804,7 +12967,6 @@ void ReplicatedPG::_scrub(
 		<< " can't decode '" << SS_ATTR << "' attr " << e.what();
 	  ++scrubber.shallow_errors;
 	  head_error.set_ss_attr_corrupted();
-	  head_error.set_ss_attr_missing(); // Not available too
         }
       }
 
@@ -12945,7 +13107,7 @@ void ReplicatedPG::_scrub(
     ++scrubber.num_digest_updates_pending;
   }
 
-  dout(10) << "_scrub (" << mode << ") finish" << dendl;
+  dout(10) << __func__ << " (" << mode << ") finish" << dendl;
 }
 
 void ReplicatedPG::_scrub_clear_state()

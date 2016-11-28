@@ -227,7 +227,7 @@ class MDSRank {
     ceph::heartbeat_handle_d *hb;  // Heartbeat for threads using mds_lock
     void heartbeat_reset();
 
-    bool is_stale_message(Message *m);
+    bool is_stale_message(Message *m) const;
 
     map<mds_rank_t, version_t> peer_mdsmap_epoch;
 
@@ -278,7 +278,6 @@ class MDSRank {
         MDSMap *& mdsmap_,
         Messenger *msgr,
         MonClient *monc_,
-        Objecter *objecter_,
         Context *respawn_hook_,
         Context *suicide_hook_);
     ~MDSRank();
@@ -355,6 +354,7 @@ class MDSRank {
 
     void set_osd_epoch_barrier(epoch_t e);
     epoch_t get_osd_epoch_barrier() const {return osd_epoch_barrier;}
+    epoch_t get_osd_epoch() const;
 
     ceph_tid_t issue_tid() { return ++last_tid; }
 
@@ -362,7 +362,7 @@ class MDSRank {
 
     MDSMap *get_mds_map() { return mdsmap; }
 
-    int get_req_rate() { return logger->get(l_mds_request); }
+    int get_req_rate() const { return logger->get(l_mds_request); }
   
     int get_mds_slow_req_count() const { return mds_slow_req_count; }
 
@@ -519,7 +519,6 @@ public:
       MDSMap *& mdsmap_,
       Messenger *msgr,
       MonClient *monc_,
-      Objecter *objecter_,
       Context *respawn_hook_,
       Context *suicide_hook_);
 };

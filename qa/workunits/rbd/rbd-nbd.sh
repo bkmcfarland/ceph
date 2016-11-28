@@ -32,7 +32,7 @@ function cleanup()
 	${SUDO} rbd-nbd unmap ${DEV}
     fi
     if rbd -p ${POOL} status ${IMAGE} 2>/dev/null; then
-	for s in 0.1 0.2 0.4 0.8 1.6 3.2 6.4 12.8; do
+	for s in 0.5 1 2 4 8 16 32; do
 	    sleep $s
 	    rbd -p ${POOL} status ${IMAGE} | grep 'Watchers: none' && break
 	done
@@ -76,15 +76,15 @@ DEV=`${SUDO} rbd-nbd --device ${dev1} map ${POOL}/${IMAGE}`
 [ "${DEV}" = "${dev1}" ]
 ${SUDO} rbd-nbd list-mapped | grep "^${DEV}$"
 
-#read test
+# read test
 [ "`dd if=${DATA} bs=1M | md5sum`" = "`${SUDO} dd if=${DEV} bs=1M | md5sum`" ]
 
-#write test
+# write test
 dd if=/dev/urandom of=${DATA} bs=1M count=${SIZE}
 ${SUDO} dd if=${DATA} of=${DEV} bs=1M oflag=direct
 [ "`dd if=${DATA} bs=1M | md5sum`" = "`rbd -p ${POOL} --no-progress export ${IMAGE} - | md5sum`" ]
 
-#trim test
+# trim test
 provisioned=`rbd -p ${POOL} --format xml du ${IMAGE} |
   $XMLSTARLET sel -t -m "//stats/images/image/provisioned_size" -v .`
 used=`rbd -p ${POOL} --format xml du ${IMAGE} |
@@ -97,5 +97,37 @@ provisioned=`rbd -p ${POOL} --format xml du ${IMAGE} |
 used=`rbd -p ${POOL} --format xml du ${IMAGE} |
   $XMLSTARLET sel -t -m "//stats/images/image/used_size" -v .`
 [ "${used}" -lt "${provisioned}" ]
+
+# resize test
+devname=$(basename ${DEV})
+blocks=$(awk -v dev=${devname} '$4 == dev {print $3}' /proc/partitions)
+test -n "${blocks}"
+rbd resize ${POOL}/${IMAGE} --size $((SIZE * 2))M
+rbd info ${POOL}/${IMAGE}
+blocks2=$(awk -v dev=${devname} '$4 == dev {print $3}' /proc/partitions)
+test -n "${blocks2}"
+test ${blocks2} -eq $((blocks * 2))
+rbd resize ${POOL}/${IMAGE} --allow-shrink --size ${SIZE}M
+blocks2=$(awk -v dev=${devname} '$4 == dev {print $3}' /proc/partitions)
+test -n "${blocks2}"
+test ${blocks2} -eq ${blocks}
+
+# read-only option test
+${SUDO} rbd-nbd unmap ${DEV}
+DEV=`${SUDO} rbd-nbd map --read-only ${POOL}/${IMAGE}`
+${SUDO} rbd-nbd list-mapped | grep "^${DEV}$"
+${SUDO} dd if=${DEV} of=/dev/null bs=1M
+expect_false ${SUDO} dd if=${DATA} of=${DEV} bs=1M oflag=direct
+${SUDO} rbd-nbd unmap ${DEV}
+
+# exclusive option test
+DEV=`${SUDO} rbd-nbd map --exclusive ${POOL}/${IMAGE}`
+${SUDO} rbd-nbd list-mapped | grep "^${DEV}$"
+${SUDO} dd if=${DATA} of=${DEV} bs=1M oflag=direct
+expect_false timeout 10 \
+	rbd bench ${IMAGE} --io-type write --io-size=1024 --io-total=1024
+${SUDO} rbd-nbd unmap ${DEV}
+DEV=
+rbd bench ${IMAGE} --io-type write --io-size=1024 --io-total=1024
 
 echo OK

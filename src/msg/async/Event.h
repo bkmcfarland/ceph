@@ -84,10 +84,12 @@ class EventDriver {
  * EventCenter maintain a set of file descriptor and handle registered events.
  */
 class EventCenter {
-
-  using clock_type = ceph::coarse_mono_clock;
+ public:
   // should be enough;
   static const int MAX_EVENTCENTER = 24;
+
+ private:
+  using clock_type = ceph::coarse_mono_clock;
 
   struct AssociatedCenters {
     EventCenter *centers[MAX_EVENTCENTER];
@@ -127,7 +129,7 @@ class EventCenter {
   NetHandler net;
   EventCallbackRef notify_handler;
   unsigned idx = 10000;
-  AssociatedCenters *global_centers;
+  AssociatedCenters *global_centers = nullptr;
 
   int process_time_events();
   FileEvent *_get_file_event(int fd) {
@@ -136,21 +138,18 @@ class EventCenter {
   }
 
  public:
-  atomic_t already_wakeup;
-
   explicit EventCenter(CephContext *c):
     cct(c), nevent(0),
     external_num_events(0),
     driver(NULL), time_event_next_id(1),
     notify_receive_fd(-1), notify_send_fd(-1), net(c),
-    notify_handler(NULL),
-    already_wakeup(0) {
-  }
+    notify_handler(NULL) { }
   ~EventCenter();
   ostream& _event_prefix(std::ostream *_dout);
 
   int init(int nevent, unsigned idx);
   void set_owner();
+  pthread_t get_owner() const { return owner; }
   unsigned get_id() const { return idx; }
 
   // Used by internal thread
@@ -183,8 +182,9 @@ class EventCenter {
       lock.lock();
       cond.notify_all();
       done = true;
+      bool del = nonwait;
       lock.unlock();
-      if (nonwait)
+      if (del)
         delete this;
     }
     void wait() {

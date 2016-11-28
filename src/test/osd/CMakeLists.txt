@@ -23,8 +23,10 @@ add_ceph_test(osd-config.sh ${CMAKE_CURRENT_SOURCE_DIR}/osd-config.sh)
 add_ceph_test(osd-markdown.sh ${CMAKE_CURRENT_SOURCE_DIR}/osd-markdown.sh) 
 add_ceph_test(osd-reactivate.sh ${CMAKE_CURRENT_SOURCE_DIR}/osd-reactivate.sh) 
 add_ceph_test(osd-reuse-id.sh ${CMAKE_CURRENT_SOURCE_DIR}/osd-reuse-id.sh)
+add_ceph_test(osd-scrub-repair.sh ${CMAKE_CURRENT_SOURCE_DIR}/osd-scrub-repair.sh) 
 add_ceph_test(osd-scrub-snaps.sh ${CMAKE_CURRENT_SOURCE_DIR}/osd-scrub-snaps.sh)
 add_ceph_test(osd-copy-from.sh ${CMAKE_CURRENT_SOURCE_DIR}/osd-copy-from.sh)
+add_ceph_test(osd-fast-mark-down.sh ${CMAKE_CURRENT_SOURCE_DIR}/osd-fast-mark-down.sh)
 
 # unittest_osdmap
 add_executable(unittest_osdmap
@@ -52,14 +54,14 @@ add_executable(unittest_osdscrub
   TestOSDScrub.cc
   )
 add_ceph_unittest(unittest_osdscrub ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/unittest_osdscrub)
-target_link_libraries(unittest_osdscrub osd global dl os mon ${BLKID_LIBRARIES})
+target_link_libraries(unittest_osdscrub osd global ${CMAKE_DL_LIBS} os mon ${BLKID_LIBRARIES})
 
 # unittest_pglog
 add_executable(unittest_pglog
   TestPGLog.cc
   )
 add_ceph_unittest(unittest_pglog ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/unittest_pglog)
-target_link_libraries(unittest_pglog osd global dl ${BLKID_LIBRARIES})
+target_link_libraries(unittest_pglog osd global ${CMAKE_DL_LIBS} ${BLKID_LIBRARIES})
 
 # unittest_hitset
 add_executable(unittest_hitset

@@ -59,6 +59,13 @@
 #define CLOCK_MONOTONIC_COARSE CLOCK_MONOTONIC
 #endif
 #endif
+#if !defined(CLOCK_REALTIME_COARSE)
+#if defined(CLOCK_REALTIME_FAST)
+#define CLOCK_REALTIME_COARSE CLOCK_REALTIME_FAST
+#else
+#define CLOCK_REALTIME_COARSE CLOCK_REALTIME
+#endif
+#endif
 
 /* And include the extra required include file */
 #include <pthread_np.h>
@@ -68,6 +75,8 @@
 #if defined(__APPLE__)
 /* PATH_MAX */
 #include <limits.h>
+#define EREMOTEIO 121
+#define HOST_NAME_MAX 255
 #endif /* __APPLE__ */
 
 /* O_LARGEFILE is not defined/required on OSX/FreeBSD */
@@ -114,25 +123,29 @@
 
 #if defined(HAVE_PTHREAD_SETNAME_NP)
   #if defined(__APPLE__)
-    #define pthread_setname_np(thread, name) ({ \
+    #define ceph_pthread_setname(thread, name) ({ \
       int __result = 0;                         \
       if (thread == pthread_self())             \
-        __result = pthread_setname_np(name)     \
+        __result = pthread_setname_np(name);    \
       __result; })
+  #else
+    #define ceph_pthread_setname pthread_setname_np
   #endif
 #elif defined(HAVE_PTHREAD_SET_NAME_NP)
   /* Fix a small name diff */
-  #define pthread_setname_np pthread_set_name_np
+  #define ceph_pthread_setname pthread_set_name_np
 #else
   /* compiler warning free success noop */
-  #define pthread_setname_np(thread, name) ({ \
+  #define ceph_pthread_setname(thread, name) ({ \
     int __i = 0;                              \
     __i; })
 #endif
 
-#if !defined(HAVE_PTHREAD_GETNAME_NP)
+#if defined(HAVE_PTHREAD_GETNAME_NP)
+  #define ceph_pthread_getname pthread_getname_np
+#else
   /* compiler warning free success noop */
-  #define pthread_getname_np(thread, name, len) ({ \
+  #define ceph_pthread_getname(thread, name, len) ({ \
     if (name != NULL)                              \
       *name = '\0';                                \
     0; })

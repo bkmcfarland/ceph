@@ -43,6 +43,7 @@
 #include "OpRequest.h"
 #include "include/cmp.h"
 #include "librados/ListObjectImpl.h"
+#include "compressor/Compressor.h"
 #include <atomic>
 
 #define CEPH_OSD_ONDISK_MAGIC "ceph osd volume v026"
@@ -60,6 +61,8 @@
 #define CEPH_OSD_FEATURE_INCOMPAT_SHARDS CompatSet::Feature(11, "sharded objects")
 #define CEPH_OSD_FEATURE_INCOMPAT_HINTS CompatSet::Feature(12, "transaction hints")
 #define CEPH_OSD_FEATURE_INCOMPAT_PGMETA CompatSet::Feature(13, "pg meta object")
+#define CEPH_OSD_FEATURE_INCOMPAT_MISSING CompatSet::Feature(14, "explicit missing set")
+#define CEPH_OSD_FEATURE_INCOMPAT_FASTINFO CompatSet::Feature(15, "fastinfo pg attr")
 
 
 /// max recovery priority for MBackfillReserve
@@ -94,9 +97,6 @@ struct pg_shard_t {
   pg_shard_t() : osd(-1), shard(shard_id_t::NO_SHARD) {}
   explicit pg_shard_t(int osd) : osd(osd), shard(shard_id_t::NO_SHARD) {}
   pg_shard_t(int osd, shard_id_t shard) : osd(osd), shard(shard) {}
-  static pg_shard_t undefined_shard() {
-    return pg_shard_t(-1, shard_id_t::NO_SHARD);
-  }
   bool is_undefined() const {
     return osd == -1;
   }
@@ -977,7 +977,15 @@ public:
     DEEP_SCRUB_INTERVAL,
     RECOVERY_PRIORITY,
     RECOVERY_OP_PRIORITY,
-    SCRUB_PRIORITY
+    SCRUB_PRIORITY,
+    COMPRESSION_MODE,
+    COMPRESSION_ALGORITHM,
+    COMPRESSION_REQUIRED_RATIO,
+    COMPRESSION_MAX_BLOB_SIZE,
+    COMPRESSION_MIN_BLOB_SIZE,
+    CSUM_TYPE,
+    CSUM_MAX_BLOCK,
+    CSUM_MIN_BLOCK,
   };
 
   enum type_t {
@@ -1352,7 +1360,6 @@ public:
   void set_flag(uint64_t f) { flags |= f; }
   void unset_flag(uint64_t f) { flags &= ~f; }
 
-  /// This method will later return true for ec pools as well
   bool ec_pool() const {
     return type == TYPE_ERASURE;
   }
@@ -1970,6 +1977,16 @@ struct pg_hit_set_info_t {
   utime_t begin, end;   ///< time interval
   eversion_t version;   ///< version this HitSet object was written
   bool using_gmt;	///< use gmt for creating the hit_set archive object name
+
+  friend bool operator==(const pg_hit_set_info_t& l,
+			 const pg_hit_set_info_t& r) {
+    return
+      l.begin == r.begin &&
+      l.end == r.end &&
+      l.version == r.version &&
+      l.using_gmt == r.using_gmt;
+  }
+
   explicit pg_hit_set_info_t(bool using_gmt = true)
     : using_gmt(using_gmt) {}
 
@@ -1989,6 +2006,13 @@ WRITE_CLASS_ENCODER(pg_hit_set_info_t)
 struct pg_hit_set_history_t {
   eversion_t current_last_update;  ///< last version inserted into current set
   list<pg_hit_set_info_t> history; ///< archived sets, sorted oldest -> newest
+
+  friend bool operator==(const pg_hit_set_history_t& l,
+			 const pg_hit_set_history_t& r) {
+    return
+      l.current_last_update == r.current_last_update &&
+      l.history == r.history;
+  }
 
   void encode(bufferlist &bl) const;
   void decode(bufferlist::iterator &bl);
@@ -2029,6 +2053,23 @@ struct pg_history_t {
   utime_t last_scrub_stamp;
   utime_t last_deep_scrub_stamp;
   utime_t last_clean_scrub_stamp;
+
+  friend bool operator==(const pg_history_t& l, const pg_history_t& r) {
+    return
+      l.epoch_created == r.epoch_created &&
+      l.last_epoch_started == r.last_epoch_started &&
+      l.last_epoch_clean == r.last_epoch_clean &&
+      l.last_epoch_split == r.last_epoch_split &&
+      l.last_epoch_marked_full == r.last_epoch_marked_full &&
+      l.same_up_since == r.same_up_since &&
+      l.same_interval_since == r.same_interval_since &&
+      l.same_primary_since == r.same_primary_since &&
+      l.last_scrub == r.last_scrub &&
+      l.last_deep_scrub == r.last_deep_scrub &&
+      l.last_scrub_stamp == r.last_scrub_stamp &&
+      l.last_deep_scrub_stamp == r.last_deep_scrub_stamp &&
+      l.last_clean_scrub_stamp == r.last_clean_scrub_stamp;
+  }
 
   pg_history_t()
     : epoch_created(0),
@@ -2126,6 +2167,22 @@ struct pg_info_t {
   pg_history_t history;
   pg_hit_set_history_t hit_set;
 
+  friend bool operator==(const pg_info_t& l, const pg_info_t& r) {
+    return
+      l.pgid == r.pgid &&
+      l.last_update == r.last_update &&
+      l.last_complete == r.last_complete &&
+      l.last_epoch_started == r.last_epoch_started &&
+      l.last_user_version == r.last_user_version &&
+      l.log_tail == r.log_tail &&
+      l.last_backfill == r.last_backfill &&
+      l.last_backfill_bitwise == r.last_backfill_bitwise &&
+      l.purged_snaps == r.purged_snaps &&
+      l.stats == r.stats &&
+      l.history == r.history &&
+      l.hit_set == r.hit_set;
+  }
+
   pg_info_t()
     : last_epoch_started(0), last_user_version(0),
       last_backfill(hobject_t::get_max()),
@@ -2184,6 +2241,152 @@ inline ostream& operator<<(ostream& out, const pg_info_t& pgi)
       << ")";
   return out;
 }
+
+/**
+ * pg_fast_info_t - common pg_info_t fields
+ *
+ * These are the fields of pg_info_t (and children) that are updated for
+ * most IO operations.
+ *
+ * ** WARNING **
+ * Because we rely on these fields to be applied to the normal
+ * info struct, adding a new field here that is not also new in info
+ * means that we must set an incompat OSD feature bit!
+ */
+struct pg_fast_info_t {
+  eversion_t last_update;
+  eversion_t last_complete;
+  version_t last_user_version;
+  struct { // pg_stat_t stats
+    eversion_t version;
+    version_t reported_seq;
+    utime_t last_fresh;
+    utime_t last_active;
+    utime_t last_peered;
+    utime_t last_clean;
+    utime_t last_unstale;
+    utime_t last_undegraded;
+    utime_t last_fullsized;
+    int64_t log_size;  // (also ondisk_log_size, which has the same value)
+    struct { // object_stat_collection_t stats;
+      struct { // objct_stat_sum_t sum
+	int64_t num_bytes;    // in bytes
+	int64_t num_objects;
+	int64_t num_object_copies;
+	int64_t num_rd;
+	int64_t num_rd_kb;
+	int64_t num_wr;
+	int64_t num_wr_kb;
+	int64_t num_objects_dirty;
+      } sum;
+    } stats;
+  } stats;
+
+  void populate_from(const pg_info_t& info) {
+    last_update = info.last_update;
+    last_complete = info.last_complete;
+    last_user_version = info.last_user_version;
+    stats.version = info.stats.version;
+    stats.reported_seq = info.stats.reported_seq;
+    stats.last_fresh = info.stats.last_fresh;
+    stats.last_active = info.stats.last_active;
+    stats.last_peered = info.stats.last_peered;
+    stats.last_clean = info.stats.last_clean;
+    stats.last_unstale = info.stats.last_unstale;
+    stats.last_undegraded = info.stats.last_undegraded;
+    stats.last_fullsized = info.stats.last_fullsized;
+    stats.log_size = info.stats.log_size;
+    stats.stats.sum.num_bytes = info.stats.stats.sum.num_bytes;
+    stats.stats.sum.num_objects = info.stats.stats.sum.num_objects;
+    stats.stats.sum.num_object_copies = info.stats.stats.sum.num_object_copies;
+    stats.stats.sum.num_rd = info.stats.stats.sum.num_rd;
+    stats.stats.sum.num_rd_kb = info.stats.stats.sum.num_rd_kb;
+    stats.stats.sum.num_wr = info.stats.stats.sum.num_wr;
+    stats.stats.sum.num_wr_kb = info.stats.stats.sum.num_wr_kb;
+    stats.stats.sum.num_objects_dirty = info.stats.stats.sum.num_objects_dirty;
+  }
+
+  bool try_apply_to(pg_info_t* info) {
+    if (last_update <= info->last_update)
+      return false;
+    info->last_update = last_update;
+    info->last_complete = last_complete;
+    info->last_user_version = last_user_version;
+    info->stats.version = stats.version;
+    info->stats.reported_seq = stats.reported_seq;
+    info->stats.last_fresh = stats.last_fresh;
+    info->stats.last_active = stats.last_active;
+    info->stats.last_peered = stats.last_peered;
+    info->stats.last_clean = stats.last_clean;
+    info->stats.last_unstale = stats.last_unstale;
+    info->stats.last_undegraded = stats.last_undegraded;
+    info->stats.last_fullsized = stats.last_fullsized;
+    info->stats.log_size = stats.log_size;
+    info->stats.ondisk_log_size = stats.log_size;
+    info->stats.stats.sum.num_bytes = stats.stats.sum.num_bytes;
+    info->stats.stats.sum.num_objects = stats.stats.sum.num_objects;
+    info->stats.stats.sum.num_object_copies = stats.stats.sum.num_object_copies;
+    info->stats.stats.sum.num_rd = stats.stats.sum.num_rd;
+    info->stats.stats.sum.num_rd_kb = stats.stats.sum.num_rd_kb;
+    info->stats.stats.sum.num_wr = stats.stats.sum.num_wr;
+    info->stats.stats.sum.num_wr_kb = stats.stats.sum.num_wr_kb;
+    info->stats.stats.sum.num_objects_dirty = stats.stats.sum.num_objects_dirty;
+    return true;
+  }
+
+  void encode(bufferlist& bl) const {
+    ENCODE_START(1, 1, bl);
+    ::encode(last_update, bl);
+    ::encode(last_complete, bl);
+    ::encode(last_user_version, bl);
+    ::encode(stats.version, bl);
+    ::encode(stats.reported_seq, bl);
+    ::encode(stats.last_fresh, bl);
+    ::encode(stats.last_active, bl);
+    ::encode(stats.last_peered, bl);
+    ::encode(stats.last_clean, bl);
+    ::encode(stats.last_unstale, bl);
+    ::encode(stats.last_undegraded, bl);
+    ::encode(stats.last_fullsized, bl);
+    ::encode(stats.log_size, bl);
+    ::encode(stats.stats.sum.num_bytes, bl);
+    ::encode(stats.stats.sum.num_objects, bl);
+    ::encode(stats.stats.sum.num_object_copies, bl);
+    ::encode(stats.stats.sum.num_rd, bl);
+    ::encode(stats.stats.sum.num_rd_kb, bl);
+    ::encode(stats.stats.sum.num_wr, bl);
+    ::encode(stats.stats.sum.num_wr_kb, bl);
+    ::encode(stats.stats.sum.num_objects_dirty, bl);
+    ENCODE_FINISH(bl);
+  }
+  void decode(bufferlist::iterator& p) {
+    DECODE_START(1, p);
+    ::decode(last_update, p);
+    ::decode(last_complete, p);
+    ::decode(last_user_version, p);
+    ::decode(stats.version, p);
+    ::decode(stats.reported_seq, p);
+    ::decode(stats.last_fresh, p);
+    ::decode(stats.last_active, p);
+    ::decode(stats.last_peered, p);
+    ::decode(stats.last_clean, p);
+    ::decode(stats.last_unstale, p);
+    ::decode(stats.last_undegraded, p);
+    ::decode(stats.last_fullsized, p);
+    ::decode(stats.log_size, p);
+    ::decode(stats.stats.sum.num_bytes, p);
+    ::decode(stats.stats.sum.num_objects, p);
+    ::decode(stats.stats.sum.num_object_copies, p);
+    ::decode(stats.stats.sum.num_rd, p);
+    ::decode(stats.stats.sum.num_rd_kb, p);
+    ::decode(stats.stats.sum.num_wr, p);
+    ::decode(stats.stats.sum.num_wr_kb, p);
+    ::decode(stats.stats.sum.num_objects_dirty, p);
+    DECODE_FINISH(p);
+  }
+};
+WRITE_CLASS_ENCODER(pg_fast_info_t)
+
 
 struct pg_notify_t {
   epoch_t query_epoch;
@@ -2744,70 +2947,414 @@ inline ostream& operator<<(ostream& out, const pg_log_t& log)
  *  kept in memory, as a supplement to pg_log_t
  *  also used to pass missing info in messages.
  */
-struct pg_missing_t {
-  struct item {
-    eversion_t need, have;
-    item() {}
-    explicit item(eversion_t n) : need(n) {}  // have no old version
-    item(eversion_t n, eversion_t h) : need(n), have(h) {}
+struct pg_missing_item {
+  eversion_t need, have;
+  pg_missing_item() {}
+  explicit pg_missing_item(eversion_t n) : need(n) {}  // have no old version
+  pg_missing_item(eversion_t n, eversion_t h) : need(n), have(h) {}
 
-    void encode(bufferlist& bl) const {
-      ::encode(need, bl);
-      ::encode(have, bl);
-    }
-    void decode(bufferlist::iterator& bl) {
-      ::decode(need, bl);
-      ::decode(have, bl);
-    }
-    void dump(Formatter *f) const {
-      f->dump_stream("need") << need;
-      f->dump_stream("have") << have;
-    }
-    static void generate_test_instances(list<item*>& o) {
-      o.push_back(new item);
-      o.push_back(new item);
-      o.back()->need = eversion_t(1, 2);
-      o.back()->have = eversion_t(1, 1);
-    }
-  }; 
-  WRITE_CLASS_ENCODER(item)
+  void encode(bufferlist& bl) const {
+    ::encode(need, bl);
+    ::encode(have, bl);
+  }
+  void decode(bufferlist::iterator& bl) {
+    ::decode(need, bl);
+    ::decode(have, bl);
+  }
+  void dump(Formatter *f) const {
+    f->dump_stream("need") << need;
+    f->dump_stream("have") << have;
+  }
+  static void generate_test_instances(list<pg_missing_item*>& o) {
+    o.push_back(new pg_missing_item);
+    o.push_back(new pg_missing_item);
+    o.back()->need = eversion_t(1, 2);
+    o.back()->have = eversion_t(1, 1);
+  }
+  bool operator==(const pg_missing_item &rhs) const {
+    return need == rhs.need && have == rhs.have;
+  }
+  bool operator!=(const pg_missing_item &rhs) const {
+    return !(*this == rhs);
+  }
+};
+WRITE_CLASS_ENCODER(pg_missing_item)
+ostream& operator<<(ostream& out, const pg_missing_item &item);
 
+class pg_missing_const_i {
+public:
+  virtual const map<hobject_t, pg_missing_item, hobject_t::ComparatorWithDefault> &
+    get_items() const = 0;
+  virtual const map<version_t, hobject_t> &get_rmissing() const = 0;
+  virtual unsigned int num_missing() const = 0;
+  virtual bool have_missing() const = 0;
+  virtual bool is_missing(const hobject_t& oid, pg_missing_item *out = nullptr) const = 0;
+  virtual bool is_missing(const hobject_t& oid, eversion_t v) const = 0;
+  virtual eversion_t have_old(const hobject_t& oid) const = 0;
+  virtual ~pg_missing_const_i() {}
+};
+
+
+template <bool Track>
+class ChangeTracker {
+public:
+  void changed(const hobject_t &obj) {}
+  template <typename F>
+  void get_changed(F &&f) const {}
+  void flush() {}
+  bool is_clean() const {
+    return true;
+  }
+};
+template <>
+class ChangeTracker<true> {
+  set<hobject_t, hobject_t::BitwiseComparator> _changed;
+public:
+  void changed(const hobject_t &obj) {
+    _changed.insert(obj);
+  }
+  template <typename F>
+  void get_changed(F &&f) const {
+    for (auto const &i: _changed) {
+      f(i);
+    }
+  }
+  void flush() {
+    _changed.clear();
+  }
+  bool is_clean() const {
+    return _changed.empty();
+  }
+};
+
+template <bool TrackChanges>
+class pg_missing_set : public pg_missing_const_i {
+  using item = pg_missing_item;
   map<hobject_t, item, hobject_t::ComparatorWithDefault> missing;  // oid -> (need v, have v)
   map<version_t, hobject_t> rmissing;  // v -> oid
+  ChangeTracker<TrackChanges> tracker;
 
-  unsigned int num_missing() const;
-  bool have_missing() const;
-  void swap(pg_missing_t& o);
-  bool is_missing(const hobject_t& oid) const;
-  bool is_missing(const hobject_t& oid, eversion_t v) const;
-  eversion_t have_old(const hobject_t& oid) const;
-  void add_next_event(const pg_log_entry_t& e);
-  void revise_need(hobject_t oid, eversion_t need);
-  void revise_have(hobject_t oid, eversion_t have);
-  void add(const hobject_t& oid, eversion_t need, eversion_t have);
-  void rm(const hobject_t& oid, eversion_t v);
-  void rm(const std::map<hobject_t, pg_missing_t::item, hobject_t::ComparatorWithDefault>::iterator &m);
-  void got(const hobject_t& oid, eversion_t v);
-  void got(const std::map<hobject_t, pg_missing_t::item, hobject_t::ComparatorWithDefault>::iterator &m);
-  void split_into(pg_t child_pgid, unsigned split_bits, pg_missing_t *omissing);
+public:
+  pg_missing_set() = default;
+
+  template <typename missing_type>
+  pg_missing_set(const missing_type &m) {
+    for (auto &&i: missing)
+      tracker.changed(i.first);
+    missing = m.get_items();
+    rmissing = m.get_rmissing();
+    for (auto &&i: missing)
+      tracker.changed(i.first);
+  }
+
+  const map<hobject_t, item, hobject_t::ComparatorWithDefault> &get_items() const override {
+    return missing;
+  }
+  const map<version_t, hobject_t> &get_rmissing() const override {
+    return rmissing;
+  }
+  unsigned int num_missing() const override {
+    return missing.size();
+  }
+  bool have_missing() const override {
+    return !missing.empty();
+  }
+  bool is_missing(const hobject_t& oid, pg_missing_item *out = nullptr) const override {
+    auto iter = missing.find(oid);
+    if (iter == missing.end())
+      return false;
+    if (out)
+      *out = iter->second;
+    return true;
+  }
+  bool is_missing(const hobject_t& oid, eversion_t v) const override {
+    map<hobject_t, item, hobject_t::ComparatorWithDefault>::const_iterator m =
+      missing.find(oid);
+    if (m == missing.end())
+      return false;
+    const item &item(m->second);
+    if (item.need > v)
+      return false;
+    return true;
+  }
+  eversion_t have_old(const hobject_t& oid) const override {
+    map<hobject_t, item, hobject_t::ComparatorWithDefault>::const_iterator m =
+      missing.find(oid);
+    if (m == missing.end())
+      return eversion_t();
+    const item &item(m->second);
+    return item.have;
+  }
+
+  void claim(pg_missing_set& o) {
+    static_assert(!TrackChanges, "Can't use claim with TrackChanges");
+    missing.swap(o.missing);
+    rmissing.swap(o.rmissing);
+  }
+
+  /*
+   * this needs to be called in log order as we extend the log.  it
+   * assumes missing is accurate up through the previous log entry.
+   */
+  void add_next_event(const pg_log_entry_t& e) {
+    if (e.is_update()) {
+      map<hobject_t, item, hobject_t::ComparatorWithDefault>::iterator missing_it;
+      missing_it = missing.find(e.soid);
+      bool is_missing_divergent_item = missing_it != missing.end();
+      if (e.prior_version == eversion_t() || e.is_clone()) {
+	// new object.
+	if (is_missing_divergent_item) {  // use iterator
+	  rmissing.erase((missing_it->second).need.version);
+	  missing_it->second = item(e.version, eversion_t());  // .have = nil
+	} else  // create new element in missing map
+	  missing[e.soid] = item(e.version, eversion_t());     // .have = nil
+      } else if (is_missing_divergent_item) {
+	// already missing (prior).
+	rmissing.erase((missing_it->second).need.version);
+	(missing_it->second).need = e.version;  // leave .have unchanged.
+      } else if (e.is_backlog()) {
+	// May not have prior version
+	assert(0 == "these don't exist anymore");
+      } else {
+	// not missing, we must have prior_version (if any)
+	assert(!is_missing_divergent_item);
+	missing[e.soid] = item(e.version, e.prior_version);
+      }
+      rmissing[e.version.version] = e.soid;
+    } else if (e.is_delete()) {
+      rm(e.soid, e.version);
+    }
+
+    tracker.changed(e.soid);
+  }
+
+  void revise_need(hobject_t oid, eversion_t need) {
+    if (missing.count(oid)) {
+      rmissing.erase(missing[oid].need.version);
+      missing[oid].need = need;            // no not adjust .have
+    } else {
+      missing[oid] = item(need, eversion_t());
+    }
+    rmissing[need.version] = oid;
+
+    tracker.changed(oid);
+  }
+
+  void revise_have(hobject_t oid, eversion_t have) {
+    if (missing.count(oid)) {
+      tracker.changed(oid);
+      missing[oid].have = have;
+    }
+  }
+
+  void add(const hobject_t& oid, eversion_t need, eversion_t have) {
+    missing[oid] = item(need, have);
+    rmissing[need.version] = oid;
+    tracker.changed(oid);
+  }
+
+  void rm(const hobject_t& oid, eversion_t v) {
+    std::map<hobject_t, item, hobject_t::ComparatorWithDefault>::iterator p = missing.find(oid);
+    if (p != missing.end() && p->second.need <= v)
+      rm(p);
+  }
+
+  void rm(std::map<hobject_t, item, hobject_t::ComparatorWithDefault>::const_iterator m) {
+    tracker.changed(m->first);
+    rmissing.erase(m->second.need.version);
+    missing.erase(m);
+  }
+
+  void got(const hobject_t& oid, eversion_t v) {
+    std::map<hobject_t, item, hobject_t::ComparatorWithDefault>::iterator p = missing.find(oid);
+    assert(p != missing.end());
+    assert(p->second.need <= v);
+    got(p);
+  }
+
+  void got(std::map<hobject_t, item, hobject_t::ComparatorWithDefault>::const_iterator m) {
+    tracker.changed(m->first);
+    rmissing.erase(m->second.need.version);
+    missing.erase(m);
+  }
+
+  void split_into(
+    pg_t child_pgid,
+    unsigned split_bits,
+    pg_missing_set *omissing) {
+    unsigned mask = ~((~0)<<split_bits);
+    for (map<hobject_t, item, hobject_t::ComparatorWithDefault>::iterator i = missing.begin();
+	 i != missing.end();
+      ) {
+      if ((i->first.get_hash() & mask) == child_pgid.m_seed) {
+	omissing->add(i->first, i->second.need, i->second.have);
+	rm(i++);
+      } else {
+	++i;
+      }
+    }
+  }
 
   void clear() {
+    for (auto const &i: missing)
+      tracker.changed(i.first);
     missing.clear();
     rmissing.clear();
   }
 
-  void resort(bool sort_bitwise);
+  void resort(bool sort_bitwise) {
+    if (missing.key_comp().bitwise != sort_bitwise) {
+      map<hobject_t, item, hobject_t::ComparatorWithDefault> tmp;
+      tmp.swap(missing);
+      missing = map<hobject_t, item, hobject_t::ComparatorWithDefault>(
+	hobject_t::ComparatorWithDefault(sort_bitwise));
+      missing.insert(tmp.begin(), tmp.end());
+    }
+  }
 
-  void encode(bufferlist &bl) const;
-  void decode(bufferlist::iterator &bl, int64_t pool = -1);
-  void dump(Formatter *f) const;
-  static void generate_test_instances(list<pg_missing_t*>& o);
+  void encode(bufferlist &bl) const {
+    ENCODE_START(3, 2, bl);
+    ::encode(missing, bl);
+    ENCODE_FINISH(bl);
+  }
+  void decode(bufferlist::iterator &bl, int64_t pool = -1) {
+    for (auto const &i: missing)
+      tracker.changed(i.first);
+    DECODE_START_LEGACY_COMPAT_LEN(3, 2, 2, bl);
+    ::decode(missing, bl);
+    DECODE_FINISH(bl);
+
+    if (struct_v < 3) {
+      // Handle hobject_t upgrade
+      map<hobject_t, item, hobject_t::ComparatorWithDefault> tmp;
+      for (map<hobject_t, item, hobject_t::ComparatorWithDefault>::iterator i =
+	     missing.begin();
+	   i != missing.end();
+	) {
+	if (!i->first.is_max() && i->first.pool == -1) {
+	  hobject_t to_insert(i->first);
+	  to_insert.pool = pool;
+	  tmp[to_insert] = i->second;
+	  missing.erase(i++);
+	} else {
+	  ++i;
+	}
+      }
+      missing.insert(tmp.begin(), tmp.end());
+    }
+
+    for (map<hobject_t,item, hobject_t::ComparatorWithDefault>::iterator it =
+	   missing.begin();
+	 it != missing.end();
+	 ++it)
+      rmissing[it->second.need.version] = it->first;
+    for (auto const &i: missing)
+      tracker.changed(i.first);
+  }
+  void dump(Formatter *f) const {
+    f->open_array_section("missing");
+    for (map<hobject_t,item, hobject_t::ComparatorWithDefault>::const_iterator p =
+	   missing.begin(); p != missing.end(); ++p) {
+      f->open_object_section("item");
+      f->dump_stream("object") << p->first;
+      p->second.dump(f);
+      f->close_section();
+    }
+    f->close_section();
+  }
+  template <typename F>
+  void filter_objects(F &&f) {
+    for (auto i = missing.begin(); i != missing.end();) {
+      if (f(i->first)) {
+	rm(i++);
+      } else {
+        ++i;
+      }
+    }
+  }
+  static void generate_test_instances(list<pg_missing_set*>& o) {
+    o.push_back(new pg_missing_set);
+    o.push_back(new pg_missing_set);
+    o.back()->add(
+      hobject_t(object_t("foo"), "foo", 123, 456, 0, ""),
+      eversion_t(5, 6), eversion_t(5, 1));
+  }
+  template <typename F>
+  void get_changed(F &&f) const {
+    tracker.get_changed(f);
+  }
+  void flush() {
+    tracker.flush();
+  }
+  bool is_clean() const {
+    return tracker.is_clean();
+  }
+  template <typename missing_t>
+  bool debug_verify_from_init(
+    const missing_t &init_missing,
+    ostream *oss) const {
+    if (!TrackChanges)
+      return true;
+    auto check_missing(init_missing.get_items());
+    tracker.get_changed([&](const hobject_t &hoid) {
+	check_missing.erase(hoid);
+	if (missing.count(hoid)) {
+	  check_missing.insert(*(missing.find(hoid)));
+	}
+      });
+    bool ok = true;
+    if (check_missing.size() != missing.size()) {
+      if (oss) {
+	*oss << "Size mismatch, check: " << check_missing.size()
+	     << ", actual: " << missing.size() << "\n";
+      }
+      ok = false;
+    }
+    for (auto &i: missing) {
+      if (!check_missing.count(i.first)) {
+	if (oss)
+	  *oss << "check_missing missing " << i.first << "\n";
+	ok = false;
+      } else if (check_missing[i.first] != i.second) {
+	if (oss)
+	  *oss << "check_missing missing item mismatch on " << i.first
+	       << ", check: " << check_missing[i.first]
+	       << ", actual: " << i.second << "\n";
+	ok = false;
+      }
+    }
+    if (oss && !ok) {
+      *oss << "check_missing: " << check_missing << "\n";
+      set<hobject_t, hobject_t::BitwiseComparator> changed;
+      tracker.get_changed([&](const hobject_t &hoid) { changed.insert(hoid); });
+      *oss << "changed: " << changed << "\n";
+    }
+    return ok;
+  }
 };
-WRITE_CLASS_ENCODER(pg_missing_t::item)
-WRITE_CLASS_ENCODER(pg_missing_t)
+template <bool TrackChanges>
+void encode(
+  const pg_missing_set<TrackChanges> &c, bufferlist &bl, uint64_t features=0) {
+  ENCODE_DUMP_PRE();
+  c.encode(bl);
+  ENCODE_DUMP_POST(cl);
+}
+template <bool TrackChanges>
+void decode(pg_missing_set<TrackChanges> &c, bufferlist::iterator &p) {
+  c.decode(p);
+}
+template <bool TrackChanges>
+ostream& operator<<(ostream& out, const pg_missing_set<TrackChanges> &missing)
+{
+  out << "missing(" << missing.num_missing();
+  //if (missing.num_lost()) out << ", " << missing.num_lost() << " lost";
+  out << ")";
+  return out;
+}
 
-ostream& operator<<(ostream& out, const pg_missing_t::item& i);
-ostream& operator<<(ostream& out, const pg_missing_t& missing);
+using pg_missing_t = pg_missing_set<false>;
+using pg_missing_tracker_t = pg_missing_set<true>;
+
 
 /**
  * pg list objects response format
@@ -3140,7 +3687,6 @@ inline ostream& operator<<(ostream& out, const OSDSuperblock& sb)
 
 // -------
 
-WRITE_CLASS_ENCODER(interval_set<uint64_t>)
 
 
 
@@ -4056,15 +4602,38 @@ struct ScrubMap {
   };
   WRITE_CLASS_ENCODER(object)
 
-  map<hobject_t,object, hobject_t::BitwiseComparator> objects;
+  bool bitwise; // ephemeral, not encoded
+  map<hobject_t,object, hobject_t::ComparatorWithDefault> objects;
   eversion_t valid_through;
   eversion_t incr_since;
 
+  ScrubMap() : bitwise(true) {}
+  ScrubMap(bool bitwise)
+    : bitwise(bitwise), objects(hobject_t::ComparatorWithDefault(bitwise)) {}
+
   void merge_incr(const ScrubMap &l);
+  void insert(const ScrubMap &r) {
+    objects.insert(r.objects.begin(), r.objects.end());
+  }
+  void swap(ScrubMap &r) {
+    ::swap(objects, r.objects);
+    ::swap(valid_through, r.valid_through);
+    ::swap(incr_since, r.incr_since);
+  }
 
   void encode(bufferlist& bl) const;
   void decode(bufferlist::iterator& bl, int64_t pool=-1);
   void dump(Formatter *f) const;
+  void reset_bitwise(bool new_bitwise) {
+    if (bitwise == new_bitwise)
+      return;
+    map<hobject_t, object, hobject_t::ComparatorWithDefault> new_objects(
+      objects.begin(),
+      objects.end(),
+      hobject_t::ComparatorWithDefault(new_bitwise));
+    ::swap(new_objects, objects);
+    bitwise = new_bitwise;
+  }
   static void generate_test_instances(list<ScrubMap*>& o);
 };
 WRITE_CLASS_ENCODER(ScrubMap::object)
@@ -4193,6 +4762,7 @@ struct obj_list_watch_response_t {
     entity_addr_t ea;
     o.push_back(new obj_list_watch_response_t);
     o.push_back(new obj_list_watch_response_t);
+    ea.set_type(entity_addr_t::TYPE_LEGACY);
     ea.set_nonce(1000);
     ea.set_family(AF_INET);
     ea.set_in4_quad(0, 127);
@@ -4358,8 +4928,8 @@ struct PromoteCounter {
 };
 
 /** store_statfs_t
-+* ObjectStore full statfs information
-+*/
+ * ObjectStore full statfs information
+ */
 struct store_statfs_t
 {
   uint64_t total = 0;                  // Total bytes

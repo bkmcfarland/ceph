@@ -97,7 +97,7 @@ typedef ceph::shared_ptr<const OSDMap> OSDMapRef;
        pg_shard_t peer,
        const hobject_t oid) = 0;
 
-     virtual void failed_push(pg_shard_t from, const hobject_t &soid) = 0;
+     virtual void failed_push(const list<pg_shard_t> &from, const hobject_t &soid) = 0;
      
      virtual void cancel_pull(const hobject_t &soid) = 0;
 
@@ -131,10 +131,10 @@ typedef ceph::shared_ptr<const OSDMap> OSDMapRef;
      virtual const map<hobject_t, set<pg_shard_t>, hobject_t::BitwiseComparator> &get_missing_loc_shards()
        const = 0;
 
-     virtual const pg_missing_t &get_local_missing() const = 0;
+     virtual const pg_missing_tracker_t &get_local_missing() const = 0;
      virtual const map<pg_shard_t, pg_missing_t> &get_shard_missing()
        const = 0;
-     virtual boost::optional<const pg_missing_t &> maybe_get_shard_missing(
+     virtual boost::optional<const pg_missing_const_i &> maybe_get_shard_missing(
        pg_shard_t peer) const {
        if (peer == primary_shard()) {
 	 return get_local_missing();
@@ -142,14 +142,14 @@ typedef ceph::shared_ptr<const OSDMap> OSDMapRef;
 	 map<pg_shard_t, pg_missing_t>::const_iterator i =
 	   get_shard_missing().find(peer);
 	 if (i == get_shard_missing().end()) {
-	   return boost::optional<const pg_missing_t &>();
+	   return boost::optional<const pg_missing_const_i &>();
 	 } else {
 	   return i->second;
 	 }
        }
      }
-     virtual const pg_missing_t &get_shard_missing(pg_shard_t peer) const {
-       boost::optional<const pg_missing_t &> m = maybe_get_shard_missing(peer);
+     virtual const pg_missing_const_i &get_shard_missing(pg_shard_t peer) const {
+       auto m = maybe_get_shard_missing(peer);
        assert(m);
        return *m;
      }
@@ -319,7 +319,7 @@ typedef ceph::shared_ptr<const OSDMap> OSDMapRef;
      OpRequestRef op ///< [in] message received
      ) = 0; ///< @return true if the message was handled
 
-   virtual void check_recovery_sources(const OSDMapRef osdmap) = 0;
+   virtual void check_recovery_sources(const OSDMapRef& osdmap) = 0;
 
 
    /**
@@ -625,30 +625,6 @@ typedef ceph::shared_ptr<const OSDMap> OSDMapRef;
      ObjectStore::CollectionHandle &ch,
      ObjectStore *store,
      CephContext *cct);
- };
-
-struct PG_SendMessageOnConn: public Context {
-  PGBackend::Listener *pg;
-  Message *reply;
-  ConnectionRef conn;
-  PG_SendMessageOnConn(
-    PGBackend::Listener *pg,
-    Message *reply,
-    ConnectionRef conn) : pg(pg), reply(reply), conn(conn) {}
-  void finish(int) {
-    pg->send_message_osd_cluster(reply, conn.get());
-  }
-};
-
-struct PG_RecoveryQueueAsync : public Context {
-  PGBackend::Listener *pg;
-  GenContext<ThreadPool::TPHandle&> *c;
-  PG_RecoveryQueueAsync(
-    PGBackend::Listener *pg,
-    GenContext<ThreadPool::TPHandle&> *c) : pg(pg), c(c) {}
-  void finish(int) {
-    pg->schedule_recovery_work(c);
-  }
 };
 
 #endif

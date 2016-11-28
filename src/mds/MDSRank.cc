@@ -49,14 +49,13 @@ MDSRank::MDSRank(
     MDSMap *& mdsmap_,
     Messenger *msgr,
     MonClient *monc_,
-    Objecter *objecter_,
     Context *respawn_hook_,
     Context *suicide_hook_)
   :
     whoami(whoami_), incarnation(0),
     mds_lock(mds_lock_), clog(clog_), timer(timer_),
     mdsmap(mdsmap_),
-    objecter(objecter_),
+    objecter(new Objecter(g_ceph_context, msgr, monc_, nullptr, 0, 0)),
     server(NULL), mdcache(NULL), locker(NULL), mdlog(NULL),
     balancer(NULL), scrubstack(NULL),
     damage_table(whoami_),
@@ -77,6 +76,8 @@ MDSRank::MDSRank(
     standby_replaying(false)
 {
   hb = g_ceph_context->get_heartbeat_map()->add_worker("MDSRank", pthread_self());
+
+  objecter->unset_honor_osdmap_full();
 
   finisher = new Finisher(msgr->cct);
 
@@ -136,10 +137,18 @@ MDSRank::~MDSRank()
 
   delete respawn_hook;
   respawn_hook = NULL;
+
+  delete objecter;
+  objecter = nullptr;
 }
 
 void MDSRankDispatcher::init()
 {
+  objecter->init();
+  messenger->add_dispatcher_head(objecter);
+
+  objecter->start();
+
   update_log_config();
   create_logger();
 
@@ -226,8 +235,6 @@ void MDSRankDispatcher::shutdown()
   // threads block on IOs that require finisher to complete.
   mdlog->shutdown();
 
-  finisher->stop(); // no flushing
-
   // shut down cache
   mdcache->shutdown();
 
@@ -240,11 +247,15 @@ void MDSRankDispatcher::shutdown()
 
   progress_thread.shutdown();
 
-  // shut down messenger
-  // release mds_lock first because messenger thread might call 
-  // MDSDaemon::ms_handle_reset which will try to hold mds_lock
+  // release mds_lock for finisher/messenger threads (e.g.
+  // MDSDaemon::ms_handle_reset called from Messenger).
   mds_lock.Unlock();
+
+  finisher->stop(); // no flushing
+
+  // shut down messenger
   messenger->shutdown();
+
   mds_lock.Lock();
 
   // Workaround unclean shutdown: HeartbeatMap will assert if
@@ -407,8 +418,8 @@ bool MDSRankDispatcher::ms_dispatch(Message *m)
   return ret;
 }
 
-/* If this function returns true, it has put the message. If it returns false,
- * it has not put the message. */
+/* If this function returns true, it recognizes the message and has taken the
+ * reference. If it returns false, it has done neither. */
 bool MDSRank::_dispatch(Message *m, bool new_msg)
 {
   if (is_stale_message(m)) {
@@ -425,7 +436,6 @@ bool MDSRank::_dispatch(Message *m, bool new_msg)
   } else {
     if (!handle_deferrable_message(m)) {
       dout(0) << "unrecognized message " << *m << dendl;
-      m->put();
       return false;
     }
   }
@@ -700,7 +710,7 @@ void MDSRank::heartbeat_reset()
   g_ceph_context->get_heartbeat_map()->reset_timeout(hb, g_conf->mds_beacon_grace, 0);
 }
 
-bool MDSRank::is_stale_message(Message *m)
+bool MDSRank::is_stale_message(Message *m) const
 {
   // from bad mds?
   if (m->get_source().is_mds()) {
@@ -1019,7 +1029,7 @@ void MDSRank::replay_start()
   calc_recovery_set();
 
   // Check if we need to wait for a newer OSD map before starting
-  Context *fin = new C_OnFinisher(new C_IO_Wrapper(this, new C_MDS_BootStart(this, MDS_BOOT_INITIAL)), finisher);
+  Context *fin = new C_IO_Wrapper(this, new C_MDS_BootStart(this, MDS_BOOT_INITIAL));
   bool const ready = objecter->wait_for_map(
       mdsmap->get_last_failure_osd_epoch(),
       fin);
@@ -1058,11 +1068,9 @@ void MDSRank::_standby_replay_restart_finish(int r, uint64_t old_read_pos)
 
 inline void MDSRank::standby_replay_restart()
 {
-  dout(1) << "standby_replay_restart"
-	  << (standby_replaying ? " (as standby)":" (final takeover pass)")
-	  << dendl;
   if (standby_replaying) {
     /* Go around for another pass of replaying in standby */
+    dout(4) << "standby_replay_restart (as standby)" << dendl;
     mdlog->get_journaler()->reread_head_and_probe(
       new C_MDS_StandbyReplayRestartFinish(
         this,
@@ -1070,9 +1078,8 @@ inline void MDSRank::standby_replay_restart()
   } else {
     /* We are transitioning out of standby: wait for OSD map update
        before making final pass */
-    Context *fin = new C_OnFinisher(new C_IO_Wrapper(this,
-          new C_MDS_BootStart(this, MDS_BOOT_PREPARE_LOG)),
-      finisher);
+    dout(1) << "standby_replay_restart (final takeover pass)" << dendl;
+    Context *fin = new C_IO_Wrapper(this, new C_MDS_BootStart(this, MDS_BOOT_PREPARE_LOG));
     bool const ready =
       objecter->wait_for_map(mdsmap->get_last_failure_osd_epoch(), fin);
     if (ready) {
@@ -1237,15 +1244,14 @@ void MDSRank::clientreplay_start()
 {
   dout(1) << "clientreplay_start" << dendl;
   finish_contexts(g_ceph_context, waiting_for_replay);  // kick waiters
+  mdcache->start_files_to_recover();
   queue_one_replay();
 }
 
 bool MDSRank::queue_one_replay()
 {
   if (replay_queue.empty()) {
-    if (mdcache->get_num_client_requests() == 0) {
-      clientreplay_done();
-    }
+    clientreplay_done();
     return false;
   }
   queue_waiter(replay_queue.front());
@@ -1270,6 +1276,7 @@ void MDSRank::active_start()
   mdcache->clean_open_file_lists();
   mdcache->export_remaining_imported_caps();
   finish_contexts(g_ceph_context, waiting_for_replay);  // kick waiters
+  mdcache->start_files_to_recover();
 
   mdcache->reissue_all_caps();
 
@@ -1405,28 +1412,7 @@ void MDSRankDispatcher::handle_mds_map(
   }
 
   // Validate state transitions while I hold a rank
-  bool state_valid = true;
-  if (state != oldstate) {
-    if (oldstate == MDSMap::STATE_REPLAY) {
-      if (state != MDSMap::STATE_RESOLVE && state != MDSMap::STATE_RECONNECT) {
-        state_valid = false;
-      }
-    } else if (oldstate == MDSMap::STATE_REJOIN) {
-      if (state != MDSMap::STATE_ACTIVE
-          && state != MDSMap::STATE_CLIENTREPLAY
-          && state != MDSMap::STATE_STOPPED) {
-        state_valid = false;
-      }
-    } else if (oldstate >= MDSMap::STATE_RECONNECT && oldstate < MDSMap::STATE_ACTIVE) {
-      // Once I have entered replay, the only allowable transitions are to
-      // the next state along in the sequence.
-      if (state != oldstate + 1) {
-        state_valid = false;
-      }
-    }
-  }
-
-  if (!state_valid) {
+  if (!MDSMap::state_transition_valid(oldstate, state)) {
     derr << "Invalid state transition " << ceph_mds_state_name(oldstate)
       << "->" << ceph_mds_state_name(state) << dendl;
     respawn();
@@ -1560,7 +1546,7 @@ void MDSRankDispatcher::handle_mds_map(
     oldmap->get_down_mds_set(&olddown);
     mdsmap->get_down_mds_set(&down);
     for (set<mds_rank_t>::iterator p = down.begin(); p != down.end(); ++p) {
-      if (olddown.count(*p) == 0) {
+      if (oldmap->have_inst(*p) && olddown.count(*p) == 0) {
         messenger->mark_down(oldmap->get_inst(*p).addr);
         handle_mds_failure(*p);
       }
@@ -1763,6 +1749,16 @@ bool MDSRankDispatcher::handle_asok_command(
       mdcache->dump_cache(f);
     } else {
       mdcache->dump_cache(path);
+    }
+  } else if (command == "dump tree") {
+    string root;
+    int64_t depth;
+    cmd_getval(g_ceph_context, cmdmap, "root", root);
+    if (!cmd_getval(g_ceph_context, cmdmap, "depth", depth))
+      depth = -1;
+    {
+      Mutex::Locker l(mds_lock);
+      mdcache->dump_cache(root, depth, f);
     }
   } else if (command == "force_readonly") {
     Mutex::Locker l(mds_lock);
@@ -2392,6 +2388,7 @@ void MDSRank::create_logger()
 
   mdlog->create_logger();
   server->create_logger();
+  sessionmap.register_perfcounters();
   mdcache->register_perfcounters();
 }
 
@@ -2549,11 +2546,10 @@ MDSRankDispatcher::MDSRankDispatcher(
     MDSMap *& mdsmap_,
     Messenger *msgr,
     MonClient *monc_,
-    Objecter *objecter_,
     Context *respawn_hook_,
     Context *suicide_hook_)
   : MDSRank(whoami_, mds_lock_, clog_, timer_, beacon_, mdsmap_,
-      msgr, monc_, objecter_, respawn_hook_, suicide_hook_)
+      msgr, monc_, respawn_hook_, suicide_hook_)
 {}
 
 bool MDSRankDispatcher::handle_command(
@@ -2622,3 +2618,9 @@ bool MDSRankDispatcher::handle_command(
     return false;
   }
 }
+
+epoch_t MDSRank::get_osd_epoch() const
+{
+  return objecter->with_osdmap(std::mem_fn(&OSDMap::get_epoch));  
+}
+

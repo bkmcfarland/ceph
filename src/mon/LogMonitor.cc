@@ -131,7 +131,7 @@ void LogMonitor::update_from_paxos(bool *need_bootstrap)
       }
 
       if (channels.do_log_to_graylog(channel)) {
-	ceph::log::Graylog::Ref graylog = channels.get_graylog(channel);
+	ceph::logging::Graylog::Ref graylog = channels.get_graylog(channel);
 	if (graylog) {
 	  graylog->log_log_entry(&le);
 	}
@@ -236,9 +236,12 @@ void LogMonitor::encode_full(MonitorDBStore::TransactionRef t)
 
 version_t LogMonitor::get_trim_to()
 {
+  if (!mon->is_leader())
+    return 0;
+
   unsigned max = g_conf->mon_max_log_epochs;
   version_t version = get_last_committed();
-  if (mon->is_leader() && version > max)
+  if (version > max)
     return version - max;
   return 0;
 }
@@ -309,6 +312,18 @@ bool LogMonitor::preprocess_log(MonOpRequestRef op)
  done:
   return true;
 }
+
+struct LogMonitor::C_Log : public C_MonOp {
+  LogMonitor *logmon;
+  C_Log(LogMonitor *p, MonOpRequestRef o) :
+    C_MonOp(o), logmon(p) {}
+  void _finish(int r) {
+    if (r == -ECANCELED) {
+      return;
+    }
+    logmon->_updated_log(op);
+  }
+};
 
 bool LogMonitor::prepare_log(MonOpRequestRef op) 
 {
@@ -710,14 +725,14 @@ bool LogMonitor::log_channel_info::do_log_to_syslog(const string &channel) {
   return ret;
 }
 
-ceph::log::Graylog::Ref LogMonitor::log_channel_info::get_graylog(
+ceph::logging::Graylog::Ref LogMonitor::log_channel_info::get_graylog(
     const string &channel)
 {
   generic_dout(25) << __func__ << " for channel '"
 		   << channel << "'" << dendl;
 
   if (graylogs.count(channel) == 0) {
-    ceph::log::Graylog::Ref graylog = ceph::log::Graylog::Ref(new ceph::log::Graylog("mon"));
+    ceph::logging::Graylog::Ref graylog = ceph::logging::Graylog::Ref(new ceph::logging::Graylog("mon"));
 
     graylog->set_fsid(g_conf->fsid);
     graylog->set_hostname(g_conf->host);
@@ -746,9 +761,7 @@ void LogMonitor::handle_conf_change(const struct md_config_t *conf,
       changed.count("mon_cluster_log_file_level") ||
       changed.count("mon_cluster_log_to_graylog") ||
       changed.count("mon_cluster_log_to_graylog_host") ||
-      changed.count("mon_cluster_log_to_graylog_port") ||
-      changed.count("fsid") ||
-      changed.count("host")) {
+      changed.count("mon_cluster_log_to_graylog_port")) {
     update_log_channels();
   }
 }

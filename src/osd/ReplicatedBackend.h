@@ -58,7 +58,7 @@ public:
     RecoveryHandle *h
     );
 
-  void check_recovery_sources(const OSDMapRef osdmap);
+  void check_recovery_sources(const OSDMapRef& osdmap);
 
   /// @see PGBackend::delay_message_until_active
   bool can_handle_while_inactive(OpRequestRef op);
@@ -371,7 +371,6 @@ private:
     hobject_t discard_temp_oid,
     const vector<pg_log_entry_t> &log_entries,
     boost::optional<pg_hit_set_history_t> &hset_history,
-    InProgressOp *op,
     ObjectStore::Transaction &op_t,
     pg_shard_t peer,
     const pg_info_t &pinfo);
@@ -407,24 +406,9 @@ private:
   };
   typedef ceph::shared_ptr<RepModify> RepModifyRef;
 
-  struct C_OSD_RepModifyApply : public Context {
-    ReplicatedBackend *pg;
-    RepModifyRef rm;
-    C_OSD_RepModifyApply(ReplicatedBackend *pg, RepModifyRef r)
-      : pg(pg), rm(r) {}
-    void finish(int r) {
-      pg->sub_op_modify_applied(rm);
-    }
-  };
-  struct C_OSD_RepModifyCommit : public Context {
-    ReplicatedBackend *pg;
-    RepModifyRef rm;
-    C_OSD_RepModifyCommit(ReplicatedBackend *pg, RepModifyRef r)
-      : pg(pg), rm(r) {}
-    void finish(int r) {
-      pg->sub_op_modify_commit(rm);
-    }
-  };
+  struct C_OSD_RepModifyApply;
+  struct C_OSD_RepModifyCommit;
+
   void sub_op_modify_applied(RepModifyRef rm);
   void sub_op_modify_commit(RepModifyRef rm);
   bool scrub_supported() { return true; }
