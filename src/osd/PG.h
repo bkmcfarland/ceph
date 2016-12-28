@@ -163,6 +163,7 @@ class PGRecoveryStats {
 };
 
 struct PGPool {
+  CephContext* cct;
   epoch_t cached_epoch;
   int64_t id;
   string name;
@@ -174,8 +175,9 @@ struct PGPool {
   interval_set<snapid_t> cached_removed_snaps;      // current removed_snaps set
   interval_set<snapid_t> newly_removed_snaps;  // newly removed in the last epoch
 
-  PGPool(OSDMapRef map, int64_t i)
-    : cached_epoch(map->get_epoch()),
+  PGPool(CephContext* cct, OSDMapRef map, int64_t i)
+    : cct(cct),
+      cached_epoch(map->get_epoch()),
       id(i),
       name(map->get_pool_name(id)),
       auid(map->get_pg_pool(id)->auid) {
@@ -374,6 +376,16 @@ public:
       return ret;
     }
 
+    bool have_unfound() const {
+      for (map<hobject_t, pg_missing_item, hobject_t::BitwiseComparator>::const_iterator i =
+	     needs_recovery_map.begin();
+	   i != needs_recovery_map.end();
+	   ++i) {
+	if (is_unfound(i->first))
+	  return true;
+      }
+      return false;
+    }
     void clear() {
       needs_recovery_map.clear();
       missing_loc.clear();
@@ -557,6 +569,7 @@ public:
   // [primary only] content recovery state
  protected:
   struct PriorSet {
+    CephContext* cct;
     const bool ec_pool;
     set<pg_shard_t> probe; /// current+prior OSDs we need to probe.
     set<int> down;  /// down osds that would normally be in @a probe and might be interesting.
@@ -564,14 +577,15 @@ public:
 
     bool pg_down;   /// some down osds are included in @a cur; the DOWN pg state bit should be set.
     boost::scoped_ptr<IsPGRecoverablePredicate> pcontdec;
-    PriorSet(bool ec_pool,
+    PriorSet(CephContext* cct,
+	     bool ec_pool,
 	     IsPGRecoverablePredicate *c,
 	     const OSDMap &osdmap,
 	     const map<epoch_t, pg_interval_t> &past_intervals,
 	     const vector<int> &up,
 	     const vector<int> &acting,
 	     const pg_info_t &info,
-	     const PG *debug_pg=NULL);
+	     const PG *debug_pg = nullptr);
 
     bool affected_by_map(const OSDMapRef osdmap, const PG *debug_pg=0) const;
   };
@@ -664,7 +678,7 @@ public:
     const char *get_state_name() { return state_name; }
     NamedState(CephContext *cct_, const char *state_name_)
       : state_name(state_name_),
-        enter_time(ceph_clock_now(cct_)) {}
+	enter_time(ceph_clock_now()) {}
     virtual ~NamedState() {}
   };
 
@@ -1037,7 +1051,7 @@ public:
   void proc_primary_info(ObjectStore::Transaction &t, const pg_info_t &info);
 
   bool have_unfound() const { 
-    return missing_loc.num_unfound() > 0;
+    return missing_loc.have_unfound();
   }
   int get_num_unfound() const {
     return missing_loc.num_unfound();
@@ -1643,6 +1657,10 @@ public:
     struct IsIncomplete : boost::statechart::event< IsIncomplete > {
       IsIncomplete() : boost::statechart::event< IsIncomplete >() {}
     };
+    struct Down;
+    struct IsDown : boost::statechart::event< IsDown > {
+      IsDown() : boost::statechart::event< IsDown >() {}
+    };
 
     struct Primary : boost::statechart::state< Primary, Started, Peering >, NamedState {
       explicit Primary(my_context ctx);
@@ -1928,7 +1946,8 @@ public:
       typedef boost::mpl::list <
 	boost::statechart::custom_reaction< QueryState >,
 	boost::statechart::transition< GotInfo, GetLog >,
-	boost::statechart::custom_reaction< MNotifyRec >
+	boost::statechart::custom_reaction< MNotifyRec >,
+	boost::statechart::transition< IsDown, Down >
 	> reactions;
       boost::statechart::result react(const QueryState& q);
       boost::statechart::result react(const MNotifyRec& infoevt);
@@ -1989,14 +2008,25 @@ public:
       boost::statechart::result react(const MLogRec& logrec);
     };
 
+    struct Down : boost::statechart::state< Down, Peering>, NamedState {
+      explicit Down(my_context ctx);
+      typedef boost::mpl::list <
+	boost::statechart::custom_reaction< QueryState >
+	> reactions;
+      boost::statechart::result react(const QueryState& infoevt);
+      void exit();
+    };
+
     struct Incomplete : boost::statechart::state< Incomplete, Peering>, NamedState {
       typedef boost::mpl::list <
 	boost::statechart::custom_reaction< AdvMap >,
-	boost::statechart::custom_reaction< MNotifyRec >
+	boost::statechart::custom_reaction< MNotifyRec >,
+	boost::statechart::custom_reaction< QueryState >
 	> reactions;
       explicit Incomplete(my_context ctx);
       boost::statechart::result react(const AdvMap &advmap);
       boost::statechart::result react(const MNotifyRec& infoevt);
+      boost::statechart::result react(const QueryState& infoevt);
       void exit();
     };
 
@@ -2179,6 +2209,7 @@ private:
 
 public:
   static int _prepare_write_info(
+    CephContext* cct,
     map<string,bufferlist> *km,
     epoch_t epoch,
     pg_info_t &info,
@@ -2187,7 +2218,7 @@ public:
     bool dirty_big_info,
     bool dirty_epoch,
     bool try_fast_info,
-    PerfCounters *logger = NULL);
+    PerfCounters *logger = nullptr);
   void write_if_dirty(ObjectStore::Transaction& t);
 
   PGLog::IndexedLog projected_log;

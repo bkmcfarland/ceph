@@ -170,6 +170,7 @@ for i in `seq 1 5`; do
   rand_str=`dd if=/dev/urandom bs=4 count=1 | hexdump -x`
   run_expect_succ "$RADOS_TOOL" -p "$POOL" setomapheader $objname "$rand_str"
   run_expect_succ --tee "$fname.omap.header" "$RADOS_TOOL" -p "$POOL" getomapheader $objname
+
 # a few random omap keys
   for j in `seq 1 4`; do
     rand_str=`dd if=/dev/urandom bs=4 count=1 | hexdump -x`
@@ -281,7 +282,7 @@ cleanup() {
 
 test_omap() {
     cleanup
-    for i in $(seq 1 1 600)
+    for i in $(seq 1 1 10)
     do
 	if [ $(($i % 2)) -eq 0 ]; then
             $RADOS_TOOL -p $POOL setomapval $OBJ $i $i
@@ -290,7 +291,26 @@ test_omap() {
 	fi
         $RADOS_TOOL -p $POOL getomapval $OBJ $i | grep -q "|$i|\$"
     done
-    $RADOS_TOOL -p $POOL listomapvals $OBJ | grep -c value | grep 600
+    $RADOS_TOOL -p $POOL listomapvals $OBJ | grep -c value | grep 10
+    for i in $(seq 1 1 5)
+    do
+        $RADOS_TOOL -p $POOL rmomapkey $OBJ $i
+    done
+    $RADOS_TOOL -p $POOL listomapvals $OBJ | grep -c value | grep 5
+    cleanup
+
+    for i in $(seq 1 1 10)
+    do
+        dd if=/dev/urandom bs=128 count=1 > $TDIR/omap_key
+        if [ $(($i % 2)) -eq 0 ]; then
+            $RADOS_TOOL -p $POOL --omap-key-file $TDIR/omap_key setomapval $OBJ $i
+        else
+            echo -n "$i" | $RADOS_TOOL -p $POOL --omap-key-file $TDIR/omap_key setomapval $OBJ
+        fi
+        $RADOS_TOOL -p $POOL --omap-key-file $TDIR/omap_key getomapval $OBJ | grep -q "|$i|\$"
+        $RADOS_TOOL -p $POOL --omap-key-file $TDIR/omap_key rmomapkey $OBJ
+        $RADOS_TOOL -p $POOL listomapvals $OBJ | grep -c value | grep 0
+    done
     cleanup
 }
 
@@ -320,13 +340,13 @@ test_rmobj() {
     $CEPH_TOOL osd pool create $p 1
     $CEPH_TOOL osd pool set-quota $p max_objects 1
     V1=`mktemp fooattrXXXXXXX`
-    rados put $OBJ $V1 -p $p
+    $RADOS_TOOL put $OBJ $V1 -p $p
     while ! $CEPH_TOOL osd dump | grep 'full max_objects'
     do
 	sleep 2
     done
-    rados -p $p rm $OBJ --force-full
-    rados rmpool $p $p --yes-i-really-really-mean-it
+    $RADOS_TOOL -p $p rm $OBJ --force-full
+    $RADOS_TOOL rmpool $p $p --yes-i-really-really-mean-it
     rm $V1
 }
 
@@ -437,13 +457,13 @@ function test_append()
 {
   # rados append test:
   # replicated pool
-  ceph osd pool create rados_append 100 100 replicated
+  $CEPH_TOOL osd pool create rados_append 100 100 replicated
   # create object
   touch ./rados_append_null
-  rados -p rados_append append rados_append_obj ./rados_append_null
-  rados -p rados_append get rados_append_obj ./rados_append_0_out
+  $RADOS_TOOL -p rados_append append rados_append_obj ./rados_append_null
+  $RADOS_TOOL -p rados_append get rados_append_obj ./rados_append_0_out
   orig_size=`ls -l ./rados_append_null | awk -F ' '  '{print $5}'`
-  rados -p rados_append get rados_append_obj ./rados_append_0_out
+  $RADOS_TOOL -p rados_append get rados_append_obj ./rados_append_0_out
   orig_size=`ls -l ./rados_append_null | awk -F ' '  '{print $5}'`
   read_size=`ls -l ./rados_append_0_out | awk -F ' '  '{print $5}'`
   if [ $orig_size -ne $read_size ];
@@ -453,8 +473,8 @@ function test_append()
 
   # append 4k, total size 4k
   dd if=/dev/zero of=./rados_append_4k bs=4k count=1
-  rados -p rados_append append rados_append_obj ./rados_append_4k
-  rados -p rados_append get rados_append_obj ./rados_append_4k_out
+  $RADOS_TOOL -p rados_append append rados_append_obj ./rados_append_4k
+  $RADOS_TOOL -p rados_append get rados_append_obj ./rados_append_4k_out
   orig_size=`ls -l ./rados_append_4k  | awk -F ' '  '{print $5}'`
   read_size=`ls -l ./rados_append_4k_out | awk -F ' '  '{print $5}'`
   if [ $orig_size -ne $read_size ];
@@ -463,10 +483,10 @@ function test_append()
   fi
 
   # append 4k, total size 8k
-  rados -p rados_append append rados_append_obj ./rados_append_4k
-  rados -p rados_append get rados_append_obj ./rados_append_4k_out
+  $RADOS_TOOL -p rados_append append rados_append_obj ./rados_append_4k
+  $RADOS_TOOL -p rados_append get rados_append_obj ./rados_append_4k_out
   read_size=`ls -l ./rados_append_4k_out | awk -F ' '  '{print $5}'`
-  rados -p rados_append get rados_append_obj ./rados_append_4k_out
+  $RADOS_TOOL -p rados_append get rados_append_obj ./rados_append_4k_out
   read_size=`ls -l ./rados_append_4k_out | awk -F ' '  '{print $5}'`
   if [ 8192 -ne $read_size ];
   then
@@ -475,8 +495,8 @@ function test_append()
 
   # append 10M, total size 10493952
   dd if=/dev/zero of=./rados_append_10m bs=10M count=1
-  rados -p rados_append append rados_append_obj ./rados_append_10m
-  rados -p rados_append get rados_append_obj ./rados_append_10m_out
+  $RADOS_TOOL -p rados_append append rados_append_obj ./rados_append_10m
+  $RADOS_TOOL -p rados_append get rados_append_obj ./rados_append_10m_out
   read_size=`ls -l ./rados_append_10m_out | awk -F ' '  '{print $5}'`
   if [ 10493952 -ne $read_size ];
   then
@@ -484,15 +504,15 @@ function test_append()
   fi
 
   # cleanup
-  ceph osd pool delete rados_append rados_append --yes-i-really-really-mean-it
+  $CEPH_TOOL osd pool delete rados_append rados_append --yes-i-really-really-mean-it
 
   #erasure coded pool
-  ceph osd erasure-code-profile set myprofile k=2 m=1 ruleset-failure-domain=osd
-  ceph osd pool create rados_append 100 100 erasure myprofile
+  $CEPH_TOOL osd erasure-code-profile set myprofile k=2 m=1 ruleset-failure-domain=osd
+  $CEPH_TOOL osd pool create rados_append 100 100 erasure myprofile
 
   # create object
-  rados -p rados_append append rados_append_obj ./rados_append_null
-  rados -p rados_append get rados_append_obj ./rados_append_0_out
+  $RADOS_TOOL -p rados_append append rados_append_obj ./rados_append_null
+  $RADOS_TOOL -p rados_append get rados_append_obj ./rados_append_0_out
   orig_size=`ls -l ./rados_append_null | awk -F ' '  '{print $5}'`
   read_size=`ls -l ./rados_append_0_out | awk -F ' '  '{print $5}'`
   if [ $orig_size -ne $read_size ];
@@ -501,8 +521,8 @@ function test_append()
   fi
 
   # append 4k, total size 4k
-  rados -p rados_append append rados_append_obj ./rados_append_4k
-  rados -p rados_append get rados_append_obj ./rados_append_4k_out
+  $RADOS_TOOL -p rados_append append rados_append_obj ./rados_append_4k
+  $RADOS_TOOL -p rados_append get rados_append_obj ./rados_append_4k_out
   orig_size=`ls -l ./rados_append_4k  | awk -F ' '  '{print $5}'`
   read_size=`ls -l ./rados_append_4k_out | awk -F ' '  '{print $5}'`
   if [ $orig_size -ne $read_size ];
@@ -511,8 +531,8 @@ function test_append()
   fi
 
   # append 4k, total size 8k
-  rados -p rados_append append rados_append_obj ./rados_append_4k
-  rados -p rados_append get rados_append_obj ./rados_append_4k_out
+  $RADOS_TOOL -p rados_append append rados_append_obj ./rados_append_4k
+  $RADOS_TOOL -p rados_append get rados_append_obj ./rados_append_4k_out
   read_size=`ls -l ./rados_append_4k_out | awk -F ' '  '{print $5}'`
   if [ 8192 -ne $read_size ];
   then
@@ -520,8 +540,8 @@ function test_append()
   fi
 
   # append 10M, total size 10493952
-  rados -p rados_append append rados_append_obj ./rados_append_10m
-  rados -p rados_append get rados_append_obj ./rados_append_10m_out
+  $RADOS_TOOL -p rados_append append rados_append_obj ./rados_append_10m
+  $RADOS_TOOL -p rados_append get rados_append_obj ./rados_append_10m_out
   read_size=`ls -l ./rados_append_10m_out | awk -F ' '  '{print $5}'`
   if [ 10493952 -ne $read_size ];
   then
@@ -529,9 +549,38 @@ function test_append()
   fi
 
   # cleanup
-  ceph osd pool delete rados_append rados_append --yes-i-really-really-mean-it
+  $CEPH_TOOL osd pool delete rados_append rados_append --yes-i-really-really-mean-it
   rm -rf ./rados_append_null ./rados_append_0_out
   rm -rf ./rados_append_4k ./rados_append_4k_out ./rados_append_10m ./rados_append_10m_out
+}
+
+function test_put()
+{
+  # rados put test:
+  cleanup
+
+  # create file in local fs
+  dd if=/dev/urandom of=rados_object_10k bs=1KB count=10
+
+  # test put command
+  $RADOS_TOOL -p $POOL put $OBJ ./rados_object_10k
+  $RADOS_TOOL -p $POOL get $OBJ ./rados_object_10k_out
+  cmp ./rados_object_10k ./rados_object_10k_out
+  cleanup
+
+  # test put command with offset 0
+  $RADOS_TOOL -p $POOL put $OBJ ./rados_object_10k --offset 0
+  $RADOS_TOOL -p $POOL get $OBJ ./rados_object_offset_0_out
+  cmp ./rados_object_10k ./rados_object_offset_0_out
+  cleanup
+
+  # test put command with offset 1000
+  $RADOS_TOOL -p $POOL put $OBJ ./rados_object_10k --offset 1000
+  $RADOS_TOOL -p $POOL get $OBJ ./rados_object_offset_1000_out
+  cmp ./rados_object_10k ./rados_object_offset_1000_out 0 1000
+  cleanup
+
+  rm -rf ./rados_object_10k ./rados_object_10k_out ./rados_object_offset_0_out ./rados_object_offset_1000_out
 }
 
 test_xattr
@@ -540,6 +589,7 @@ test_rmobj
 test_ls
 test_cleanup
 test_append
+test_put
 
 echo "SUCCESS!"
 exit 0

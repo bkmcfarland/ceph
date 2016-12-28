@@ -47,6 +47,7 @@
 
 #include "NVMEDevice.h"
 
+#define dout_context g_ceph_context
 #define dout_subsys ceph_subsys_bdev
 #undef dout_prefix
 #define dout_prefix *_dout << "bdev(" << sn << ") "
@@ -110,7 +111,7 @@ struct Task {
   Task(NVMEDevice *dev, IOCommand c, uint64_t off, uint64_t l, int64_t rc = 0)
     : device(dev), command(c), offset(off), len(l),
       return_code(rc),
-      start(ceph::coarse_real_clock::now(g_ceph_context)) {}
+      start(ceph::coarse_real_clock::now()) {}
   ~Task() {
     assert(!io_request.nseg);
   }
@@ -389,7 +390,8 @@ void SharedDriverData::_aio_thread()
   int r = 0;
   const int max = 4;
   uint64_t lba_off, lba_count;
-  ceph::coarse_real_clock::time_point cur, start = ceph::coarse_real_clock::now(g_ceph_context);
+  ceph::coarse_real_clock::time_point cur, start
+    = ceph::coarse_real_clock::now();
   while (true) {
     bool inflight = queue_op_seq.load() - completed_op_seq.load();
  again:
@@ -423,7 +425,7 @@ void SharedDriverData::_aio_thread()
             derr << __func__ << " failed to do write command" << dendl;
             ceph_abort();
           }
-          cur = ceph::coarse_real_clock::now(g_ceph_context);
+          cur = ceph::coarse_real_clock::now();
           auto dur = std::chrono::duration_cast<std::chrono::nanoseconds>(cur - start);
           logger->tinc(l_bluestore_nvmedevice_aio_write_queue_lat, dur);
           break;
@@ -447,7 +449,7 @@ void SharedDriverData::_aio_thread()
             std::unique_lock<std::mutex> l(t->ctx->lock);
             t->ctx->cond.notify_all();
           } else {
-            cur = ceph::coarse_real_clock::now(g_ceph_context);
+            cur = ceph::coarse_real_clock::now();
             auto dur = std::chrono::duration_cast<std::chrono::nanoseconds>(cur - start);
             logger->tinc(l_bluestore_nvmedevice_read_queue_lat, dur);
           }
@@ -463,7 +465,7 @@ void SharedDriverData::_aio_thread()
             std::unique_lock<std::mutex> l(t->ctx->lock);
             t->ctx->cond.notify_all();
           } else {
-            cur = ceph::coarse_real_clock::now(g_ceph_context);
+            cur = ceph::coarse_real_clock::now();
             auto dur = std::chrono::duration_cast<std::chrono::nanoseconds>(cur - start);
             logger->tinc(l_bluestore_nvmedevice_flush_queue_lat, dur);
           }
@@ -495,13 +497,13 @@ void SharedDriverData::_aio_thread()
 
         Mutex::Locker l(queue_lock);
         if (queue_empty.load()) {
-          cur = ceph::coarse_real_clock::now(g_ceph_context);
+	  cur = ceph::coarse_real_clock::now();
           auto dur = std::chrono::duration_cast<std::chrono::nanoseconds>(cur - start);
           logger->tinc(l_bluestore_nvmedevice_polling_lat, dur);
           if (aio_stop)
             break;
           queue_cond.Wait(queue_lock);
-          start = ceph::coarse_real_clock::now(g_ceph_context);
+          start = ceph::coarse_real_clock::now();
         }
       }
     }
@@ -587,7 +589,7 @@ static bool probe_cb(void *cb_ctx, struct spdk_pci_device *pci_dev)
 
   if (spdk_pci_device_has_non_uio_driver(pci_dev)) {
     /*NVMe kernel driver case*/
-    if (g_conf->bdev_nvme_unbind_from_kernel) {
+    if (g_ceph_context->_conf->bdev_nvme_unbind_from_kernel) {
       r =  spdk_pci_device_switch_to_uio_driver(pci_dev);
       if (r < 0) {
         derr << __func__ << " device " << name
@@ -626,6 +628,17 @@ int NVMEManager::try_get(const string &sn_tag, SharedDriverData **driver)
 {
   Mutex::Locker l(lock);
   int r = 0;
+
+  string prefix = "--file-prefix=";
+  string sock_mem = "--socket-mem=";
+  string coremask = "-c ";
+  prefix += sn_tag;
+  sock_mem += g_conf->bluestore_spdk_socket_mem;
+  coremask += g_conf->bluestore_spdk_coremask;
+  char *prefix_arg = (char *)prefix.c_str();
+  char *sock_mem_arg = (char *)sock_mem.c_str();
+  char *coremask_arg = (char *)coremask.c_str();
+
   if (sn_tag.empty()) {
     r = -ENOENT;
     derr << __func__ << " empty serial number: " << cpp_strerror(r) << dendl;
@@ -642,11 +655,13 @@ int NVMEManager::try_get(const string &sn_tag, SharedDriverData **driver)
   if (!init) {
     init = true;
     dpdk_thread = std::thread(
-      [this]() {
+      [this, prefix_arg, sock_mem_arg, coremask_arg]() {
         static const char *ealargs[] = {
             "ceph-osd",
-            "-c 0x3", /* This must be the second parameter. It is overwritten by index in main(). */
+            coremask_arg, /* This must be the second parameter. It is overwritten by index in main(). */
             "-n 4",
+	    sock_mem_arg,
+	    prefix_arg
         };
 
         int r = rte_eal_init(sizeof(ealargs) / sizeof(ealargs[0]), (char **)(void *)(uintptr_t)ealargs);
@@ -665,7 +680,7 @@ int NVMEManager::try_get(const string &sn_tag, SharedDriverData **driver)
         }
 
         pci_system_init();
-        spdk_nvme_retry_count = g_conf->bdev_nvme_retry_count;
+        spdk_nvme_retry_count = g_ceph_context->_conf->bdev_nvme_retry_count;
         if (spdk_nvme_retry_count < 0)
           spdk_nvme_retry_count = SPDK_NVME_DEFAULT_RETRY_COUNT;
 
@@ -711,7 +726,7 @@ void io_complete(void *t, const struct spdk_nvme_cpl *completion)
   SharedDriverData *driver = task->device->get_driver();
   ++driver->completed_op_seq;
   auto dur = std::chrono::duration_cast<std::chrono::nanoseconds>(
-      ceph::coarse_real_clock::now(g_ceph_context) - task->start);
+      ceph::coarse_real_clock::now() - task->start);
   if (task->command == IOCommand::WRITE_COMMAND) {
     driver->logger->tinc(l_bluestore_nvmedevice_aio_write_lat, dur);
     assert(!spdk_nvme_cpl_is_error(completion));
@@ -761,8 +776,9 @@ void io_complete(void *t, const struct spdk_nvme_cpl *completion)
 #undef dout_prefix
 #define dout_prefix *_dout << "bdev(" << name << ") "
 
-NVMEDevice::NVMEDevice(aio_callback_t cb, void *cbpriv)
-    : driver(NULL),
+NVMEDevice::NVMEDevice(CephContext* cct, aio_callback_t cb, void *cbpriv)
+  :   BlockDevice(cct),
+      driver(nullptr),
       size(0),
       block_size(0),
       aio_stop(false),
@@ -805,7 +821,7 @@ int NVMEDevice::open(string p)
   serial_number = string(buf, r);
   r = manager.try_get(serial_number, &driver);
   if (r < 0) {
-    derr << __func__ << " failed to get nvme deivce with sn " << serial_number << dendl;
+    derr << __func__ << " failed to get nvme device with sn " << serial_number << dendl;
     return r;
   }
 
@@ -843,10 +859,10 @@ void NVMEDevice::close()
 int NVMEDevice::flush()
 {
   dout(10) << __func__ << " start" << dendl;
-  auto start = ceph::coarse_real_clock::now(g_ceph_context);
+  auto start = ceph::coarse_real_clock::now();
   driver->flush_wait();
   auto dur = std::chrono::duration_cast<std::chrono::nanoseconds>(
-      ceph::coarse_real_clock::now(g_ceph_context) - start);
+      ceph::coarse_real_clock::now() - start);
   driver->logger->tinc(l_bluestore_nvmedevice_flush_lat, dur);
   return 0;
 }
@@ -958,7 +974,7 @@ int NVMEDevice::read_random(uint64_t off, uint64_t len, char *buf, bool buffered
   uint64_t aligned_len = align_up(off+len, block_size) - aligned_off;
   dout(5) << __func__ << " " << off << "~" << len
           << " aligned " << aligned_off << "~" << aligned_len << dendl;
-  IOContext ioc(nullptr);
+  IOContext ioc(g_ceph_context, nullptr);
   Task *t = new Task(this, IOCommand::READ_COMMAND, aligned_off, aligned_len, 1);
   int r = 0;
   t->ctx = &ioc;

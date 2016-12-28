@@ -12,6 +12,8 @@
 #include "osd/osd_types.h"
 #include "osd/OSDMap.h"
 
+#define dout_context g_ceph_context
+
 // --
 
 void PGMap::Incremental::encode(bufferlist &bl, uint64_t features) const
@@ -952,7 +954,7 @@ void PGMap::dump_osd_stats(ostream& ss) const
   tab.define_column("USED", TextTable::LEFT, TextTable::RIGHT);
   tab.define_column("AVAIL", TextTable::LEFT, TextTable::RIGHT);
   tab.define_column("TOTAL", TextTable::LEFT, TextTable::RIGHT);
-  tab.define_column("HB_IN", TextTable::LEFT, TextTable::RIGHT);
+  tab.define_column("HB_PEERS", TextTable::LEFT, TextTable::RIGHT);
   tab.define_column("PG_SUM", TextTable::LEFT, TextTable::RIGHT);
 
   for (ceph::unordered_map<int32_t,osd_stat_t>::const_iterator p = osd_stat.begin();
@@ -962,7 +964,7 @@ void PGMap::dump_osd_stats(ostream& ss) const
         << si_t(p->second.kb_used << 10)
         << si_t(p->second.kb_avail << 10)
         << si_t(p->second.kb << 10)
-        << p->second.hb_in
+        << p->second.hb_peers
         << get_num_pg_by_osd(p->first)
         << TextTable::endrow;
   }
@@ -2171,7 +2173,7 @@ void PGMapUpdater::register_pg(
     stats.last_deep_scrub_stamp = ps.last_deep_scrub_stamp;
     stats.last_clean_scrub_stamp = ps.last_clean_scrub_stamp;
   } else {
-    utime_t now = ceph_clock_now(g_ceph_context);
+    utime_t now = ceph_clock_now();
     stats.last_fresh = now;
     stats.last_active = now;
     stats.last_change = now;

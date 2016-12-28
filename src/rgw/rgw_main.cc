@@ -284,6 +284,11 @@ int main(int argc, const char **argv)
     }
   }
 
+  // for region -> zonegroup conversion (must happen before common_init_finish())
+  if (!g_conf->rgw_region.empty() && g_conf->rgw_zonegroup.empty()) {
+    g_conf->set_val_or_die("rgw_zonegroup", g_conf->rgw_region.c_str());
+  }
+
   check_curl();
 
   if (g_conf->daemonize) {
@@ -415,6 +420,9 @@ int main(int argc, const char **argv)
     admin_resource->register_resource("realm", new RGWRESTMgr_Realm);
     rest.register_resource(g_conf->rgw_admin_entry, admin_resource);
   }
+
+  /* Header custom behavior */
+  rest.register_x_headers(g_conf->rgw_log_http_headers);
 
   OpsLogSocket *olog = NULL;
 

@@ -49,30 +49,17 @@ class Port {
   struct ibv_context* ctxt;
   uint8_t port_num;
   struct ibv_port_attr* port_attr;
-  int gid_tbl_len;
   uint16_t lid;
+  int gid_idx;
   union ibv_gid gid;
 
  public:
-  explicit Port(CephContext *cct, struct ibv_context* ictxt, uint8_t ipn): ctxt(ictxt), port_num(ipn), port_attr(new ibv_port_attr) {
-    int r = ibv_query_port(ctxt, port_num, port_attr);
-    if (r == -1) {
-      lderr(cct) << __func__  << " query port failed  " << cpp_strerror(errno) << dendl;
-      assert(0);
-    }
-
-    lid = port_attr->lid;
-    r = ibv_query_gid(ctxt, port_num, 0, &gid);
-    if (r) {
-      lderr(cct) << __func__  << " query gid failed  " << cpp_strerror(errno) << dendl;
-      assert(0);
-    }
-  }
-
+  explicit Port(CephContext *cct, struct ibv_context* ictxt, uint8_t ipn);
   uint16_t get_lid() { return lid; }
   ibv_gid  get_gid() { return gid; }
   uint8_t get_port_num() { return port_num; }
   ibv_port_attr* get_port_attr() { return port_attr; }
+  int get_gid_idx() { return gid_idx; }
 };
 
 
@@ -92,6 +79,7 @@ class Device {
   const char* get_name() { return name;}
   uint16_t get_lid() { return active_port->get_lid(); }
   ibv_gid get_gid() { return active_port->get_gid(); }
+  int get_gid_idx() { return active_port->get_gid_idx(); }
   void binding_port(CephContext *c, uint8_t port_num);
   struct ibv_context *ctxt;
   ibv_device_attr *device_attr;
@@ -107,7 +95,7 @@ class DeviceList {
   DeviceList(CephContext *cct): device_list(ibv_get_device_list(&num)) {
     if (device_list == NULL || num == 0) {
       lderr(cct) << __func__ << " failed to get rdma device list.  " << cpp_strerror(errno) << dendl;
-      assert(0);
+      ceph_abort();
     }
     devices = new Device*[num];
 
@@ -144,7 +132,7 @@ class Infiniband {
     {
       if (pd == NULL) {
         lderr(cct) << __func__ << " failed to allocate infiniband protection domain: " << cpp_strerror(errno) << dendl;
-        assert(0);
+        ceph_abort();
       }
     }
     ~ProtectionDomain() {
@@ -260,17 +248,17 @@ class Infiniband {
           ++c;
         }
         if (manager.enabled_huge_page)
-          delete base;
-        else
           manager.free_huge_pages(base);
+        else
+          delete base;
       }
       int add(uint32_t num) {
         uint32_t bytes = chunk_size * num;
         //cihar* base = (char*)malloc(bytes);
-        if (!manager.enabled_huge_page) {
-          base = (char*)memalign(CEPH_PAGE_SIZE, bytes);
-        } else {
+        if (manager.enabled_huge_page) {
           base = (char*)manager.malloc_huge_pages(bytes);
+        } else {
+          base = (char*)memalign(CEPH_PAGE_SIZE, bytes);
         }
         assert(base);
         for (uint32_t offset = 0; offset < bytes; offset += chunk_size){
