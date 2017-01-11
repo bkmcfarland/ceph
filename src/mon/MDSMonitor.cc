@@ -1643,22 +1643,6 @@ int MDSMonitor::management_command(
       return r;
     }
 
-    // Automatically set crash_replay_interval on data pool if it
-    // isn't already set.
-    if (data_pool->get_crash_replay_interval() == 0) {
-      // We will be changing osdmon's state and requesting the osdmon to
-      // propose.  We thus need to make sure the osdmon is writeable before
-      // we do this, waiting if it's not.
-      if (!mon->osdmon()->is_writeable()) {
-        mon->osdmon()->wait_for_writeable(op, new C_RetryMessage(this, op));
-        return -EAGAIN;
-      }
-
-      r = mon->osdmon()->set_crash_replay_interval(data, g_conf->osd_default_data_pool_replay_window);
-      assert(r == 0);  // We just did get_pg_pool so it must exist and be settable
-      request_proposal(mon->osdmon());
-    }
-
     // All checks passed, go ahead and create.
     create_new_fs(pending_fsmap, fs_name, metadata, data);
     ss << "new fs with metadata pool " << metadata << " and data pool " << data;
@@ -1758,7 +1742,8 @@ int MDSMonitor::management_command(
     // Persist the new FSMap
     pending_fsmap.filesystems[new_fs->fscid] = new_fs;
     return 0;
-  } else if (prefix == "fs set_default") {
+  } else if (prefix == "fs set_default" ||
+	     prefix == "fs set-default") {
     string fs_name;
     cmd_getval(g_ceph_context, cmdmap, "fs_name", fs_name);
     auto fs = pending_fsmap.get_filesystem(fs_name);

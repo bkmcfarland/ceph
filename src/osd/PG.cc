@@ -1551,24 +1551,6 @@ void PG::activate(ObjectStore::Transaction& t,
   assert(scrubber.callbacks.empty());
   assert(callbacks_for_degraded_object.empty());
 
-  // -- crash recovery?
-  if (acting.size() >= pool.info.min_size &&
-      is_primary() &&
-      pool.info.crash_replay_interval > 0 &&
-      may_need_replay(get_osdmap())) {
-    replay_until = ceph_clock_now();
-    replay_until += pool.info.crash_replay_interval;
-    dout(10) << "activate starting replay interval for " << pool.info.crash_replay_interval
-	     << " until " << replay_until << dendl;
-    state_set(PG_STATE_REPLAY);
-
-    // TODOSAM: osd->osd-> is no good
-    osd->osd->replay_queue_lock.Lock();
-    osd->osd->replay_queue.push_back(pair<spg_t,utime_t>(
-	info.pgid, replay_until));
-    osd->osd->replay_queue_lock.Unlock();
-  }
-
   // twiddle pg state
   state_clear(PG_STATE_DOWN);
 
@@ -1939,41 +1921,6 @@ void PG::queue_op(OpRequestRef& op)
   }
 }
 
-void PG::replay_queued_ops()
-{
-  assert(is_replay());
-  assert(is_active() || is_activating());
-  eversion_t c = info.last_update;
-  list<OpRequestRef> replay;
-  dout(10) << "replay_queued_ops" << dendl;
-  state_clear(PG_STATE_REPLAY);
-
-  for (map<eversion_t,OpRequestRef>::iterator p = replay_queue.begin();
-       p != replay_queue.end();
-       ++p) {
-    if (p->first.version != c.version+1) {
-      dout(10) << "activate replay " << p->first
-	       << " skipping " << c.version+1 - p->first.version 
-	       << " ops"
-	       << dendl;      
-      c = p->first;
-    }
-    dout(10) << "activate replay " << p->first << " "
-             << *p->second->get_req() << dendl;
-    replay.push_back(p->second);
-  }
-  replay_queue.clear();
-  if (is_active()) {
-    requeue_ops(replay);
-    requeue_ops(waiting_for_active);
-    assert(waiting_for_peered.empty());
-  } else {
-    waiting_for_active.splice(waiting_for_active.begin(), replay);
-  }
-
-  publish_stats_to_osd();
-}
-
 void PG::_activate_committed(epoch_t epoch, epoch_t activation_epoch)
 {
   lock();
@@ -2259,34 +2206,14 @@ void PG::finish_recovery_op(const hobject_t& soid, bool dequeue)
   }
 }
 
-static void split_replay_queue(
-  map<eversion_t, OpRequestRef> *from,
-  map<eversion_t, OpRequestRef> *to,
-  unsigned match,
-  unsigned bits)
-{
-  for (map<eversion_t, OpRequestRef>::iterator i = from->begin();
-       i != from->end();
-       ) {
-    if (OSD::split_request(i->second, match, bits)) {
-      to->insert(*i);
-      from->erase(i++);
-    } else {
-      ++i;
-    }
-  }
-}
-
 void PG::split_ops(PG *child, unsigned split_bits) {
   unsigned match = child->info.pgid.ps();
   assert(waiting_for_all_missing.empty());
   assert(waiting_for_cache_not_full.empty());
   assert(waiting_for_unreadable_object.empty());
   assert(waiting_for_degraded_object.empty());
-  assert(waiting_for_ack.empty());
   assert(waiting_for_ondisk.empty());
   assert(waiting_for_active.empty());
-  split_replay_queue(&replay_queue, &(child->replay_queue), match, split_bits);
 
   osd->dequeue_pg(this, &waiting_for_peered);
 
@@ -2507,13 +2434,13 @@ void PG::update_heartbeat_peers()
 
 bool PG::check_in_progress_op(
   const osd_reqid_t &r,
-  eversion_t *replay_version,
+  eversion_t *version,
   version_t *user_version,
   int *return_code) const
 {
   return (
-    projected_log.get_request(r, replay_version, user_version, return_code) ||
-    pg_log.get_log().get_request(r, replay_version, user_version, return_code));
+    projected_log.get_request(r, version, user_version, return_code) ||
+    pg_log.get_log().get_request(r, version, user_version, return_code));
 }
 
 void PG::_update_calc_stats()
@@ -4857,86 +4784,6 @@ void PG::fulfill_log(
   osd->send_message_osd_cluster(mlog, con.get());
 }
 
-
-// true if all OSDs in prior intervals may have crashed, and we need to replay
-// false positives are okay, false negatives are not.
-bool PG::may_need_replay(const OSDMapRef osdmap) const
-{
-  bool crashed = false;
-
-  for (map<epoch_t,pg_interval_t>::const_reverse_iterator p = past_intervals.rbegin();
-       p != past_intervals.rend();
-       ++p) {
-    const pg_interval_t &interval = p->second;
-    dout(10) << "may_need_replay " << interval << dendl;
-
-    if (interval.last < info.history.last_epoch_started)
-      break;  // we don't care
-
-    if (interval.acting.empty())
-      continue;
-
-    if (!interval.maybe_went_rw)
-      continue;
-
-    // look at whether any of the osds during this interval survived
-    // past the end of the interval (i.e., didn't crash and
-    // potentially fail to COMMIT a write that it ACKed).
-    bool any_survived_interval = false;
-
-    // consider ACTING osds
-    for (unsigned i=0; i<interval.acting.size(); i++) {
-      int o = interval.acting[i];
-      if (o == CRUSH_ITEM_NONE)
-	continue;
-
-      const osd_info_t *pinfo = 0;
-      if (osdmap->exists(o))
-	pinfo = &osdmap->get_info(o);
-
-      // does this osd appear to have survived through the end of the
-      // interval?
-      if (pinfo) {
-	if (pinfo->up_from <= interval.first && pinfo->up_thru > interval.last) {
-	  dout(10) << "may_need_replay  osd." << o
-		   << " up_from " << pinfo->up_from << " up_thru " << pinfo->up_thru
-		   << " survived the interval" << dendl;
-	  any_survived_interval = true;
-	}
-	else if (pinfo->up_from <= interval.first &&
-		 (std::find(acting.begin(), acting.end(), o) != acting.end() ||
-		  std::find(up.begin(), up.end(), o) != up.end())) {
-	  dout(10) << "may_need_replay  osd." << o
-		   << " up_from " << pinfo->up_from << " and is in acting|up,"
-		   << " assumed to have survived the interval" << dendl;
-	  // (if it hasn't, we will rebuild PriorSet)
-	  any_survived_interval = true;
-	}
-	else if (pinfo->up_from > interval.last &&
-		 pinfo->last_clean_begin <= interval.first &&
-		 pinfo->last_clean_end > interval.last) {
-	  dout(10) << "may_need_replay  prior osd." << o
-		   << " up_from " << pinfo->up_from
-		   << " and last clean interval ["
-		   << pinfo->last_clean_begin << "," << pinfo->last_clean_end
-		   << ") survived the interval" << dendl;
-	  any_survived_interval = true;
-	}
-      }
-    }
-
-    if (!any_survived_interval) {
-      dout(3) << "may_need_replay  no known survivors of interval "
-	      << interval.first << "-" << interval.last
-	      << ", may need replay" << dendl;
-      crashed = true;
-      break;
-    }
-  }
-
-  return crashed;
-}
-
 void PG::check_full_transition(OSDMapRef lastmap, OSDMapRef osdmap)
 {
   bool changed = false;
@@ -5197,15 +5044,6 @@ void PG::start_peering_interval(
     if (was_old_primary != is_primary()) {
       state_clear(PG_STATE_CLEAN);
       clear_publish_stats();
-	
-      // take replay queue waiters
-      list<OpRequestRef> ls;
-      for (map<eversion_t,OpRequestRef>::iterator it = replay_queue.begin();
-	   it != replay_queue.end();
-	   ++it)
-	ls.push_back(it->second);
-      replay_queue.clear();
-      requeue_ops(ls);
     }
 
     on_role_change();
@@ -5426,15 +5264,6 @@ bool PG::can_discard_op(OpRequestRef& op)
     return true;
   }
 
-  if (is_replay()) {
-    if (m->get_version().version > 0) {
-      dout(7) << " queueing replay at " << m->get_version()
-	      << " for " << *m << dendl;
-      replay_queue[m->get_version()] = op;
-      op->mark_delayed("waiting for replay");
-      return true;
-    }
-  }
   return false;
 }
 
@@ -6214,6 +6043,7 @@ PG::RecoveryState::Backfilling::Backfilling(my_context ctx)
   pg->state_clear(PG_STATE_BACKFILL_TOOFULL);
   pg->state_clear(PG_STATE_BACKFILL_WAIT);
   pg->state_set(PG_STATE_BACKFILL);
+  pg->publish_stats_to_osd();
 }
 
 boost::statechart::result
@@ -6267,6 +6097,7 @@ PG::RecoveryState::WaitRemoteBackfillReserved::WaitRemoteBackfillReserved(my_con
   context< RecoveryMachine >().log_enter(state_name);
   PG *pg = context< RecoveryMachine >().pg;
   pg->state_set(PG_STATE_BACKFILL_WAIT);
+  pg->publish_stats_to_osd();
   post_event(RemoteBackfillReserved());
 }
 
@@ -6332,6 +6163,7 @@ PG::RecoveryState::WaitRemoteBackfillReserved::react(const RemoteReservationReje
 
   pg->state_clear(PG_STATE_BACKFILL_WAIT);
   pg->state_set(PG_STATE_BACKFILL_TOOFULL);
+  pg->publish_stats_to_osd();
 
   pg->schedule_backfill_full_retry();
 
@@ -6352,6 +6184,7 @@ PG::RecoveryState::WaitLocalBackfillReserved::WaitLocalBackfillReserved(my_conte
       pg, pg->get_osdmap()->get_epoch(),
       LocalBackfillReserved()),
     pg->get_backfill_priority());
+  pg->publish_stats_to_osd();
 }
 
 void PG::RecoveryState::WaitLocalBackfillReserved::exit()
@@ -6368,6 +6201,8 @@ PG::RecoveryState::NotBackfilling::NotBackfilling(my_context ctx)
     NamedState(context< RecoveryMachine >().pg->cct, "Started/Primary/Active/NotBackfilling")
 {
   context< RecoveryMachine >().log_enter(state_name);
+  PG *pg = context< RecoveryMachine >().pg;
+  pg->publish_stats_to_osd();
 }
 
 boost::statechart::result
@@ -6582,6 +6417,7 @@ PG::RecoveryState::WaitLocalRecoveryReserved::WaitLocalRecoveryReserved(my_conte
       pg, pg->get_osdmap()->get_epoch(),
       LocalRecoveryReserved()),
     pg->get_recovery_priority());
+  pg->publish_stats_to_osd();
 }
 
 void PG::RecoveryState::WaitLocalRecoveryReserved::exit()
@@ -6641,6 +6477,7 @@ PG::RecoveryState::Recovering::Recovering(my_context ctx)
   PG *pg = context< RecoveryMachine >().pg;
   pg->state_clear(PG_STATE_RECOVERY_WAIT);
   pg->state_set(PG_STATE_RECOVERING);
+  pg->publish_stats_to_osd();
   pg->queue_recovery();
 }
 
@@ -8030,48 +7867,6 @@ PG::PriorSet::PriorSet(CephContext* cct,
 		       const PG *debug_pg)
   : cct(cct), ec_pool(ec_pool), pg_down(false), pcontdec(c)
 {
-  /*
-   * We have to be careful to gracefully deal with situations like
-   * so. Say we have a power outage or something that takes out both
-   * OSDs, but the monitor doesn't mark them down in the same epoch.
-   * The history may look like
-   *
-   *  1: A B
-   *  2:   B
-   *  3:       let's say B dies for good, too (say, from the power spike) 
-   *  4: A
-   *
-   * which makes it look like B may have applied updates to the PG
-   * that we need in order to proceed.  This sucks...
-   *
-   * To minimize the risk of this happening, we CANNOT go active if
-   * _any_ OSDs in the prior set are down until we send an MOSDAlive
-   * to the monitor such that the OSDMap sets osd_up_thru to an epoch.
-   * Then, we have something like
-   *
-   *  1: A B
-   *  2:   B   up_thru[B]=0
-   *  3:
-   *  4: A
-   *
-   * -> we can ignore B, bc it couldn't have gone active (alive_thru
-   *    still 0).
-   *
-   * or,
-   *
-   *  1: A B
-   *  2:   B   up_thru[B]=0
-   *  3:   B   up_thru[B]=2
-   *  4:
-   *  5: A    
-   *
-   * -> we must wait for B, bc it was alive through 2, and could have
-   *    written to the pg.
-   *
-   * If B is really dead, then an administrator will need to manually
-   * intervene by marking the OSD as "lost."
-   */
-
   // Include current acting and up nodes... not because they may
   // contain old data (this interval hasn't gone active, obviously),
   // but because we want their pg_info to inform choose_acting(), and

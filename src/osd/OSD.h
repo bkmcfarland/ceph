@@ -73,14 +73,12 @@ enum {
   l_osd_op_r_prepare_lat,
   l_osd_op_w,
   l_osd_op_w_inb,
-  l_osd_op_w_rlat,
   l_osd_op_w_lat,
   l_osd_op_w_process_lat,
   l_osd_op_w_prepare_lat,
   l_osd_op_rw,
   l_osd_op_rw_inb,
   l_osd_op_rw_outb,
-  l_osd_op_rw_rlat,
   l_osd_op_rw_lat,
   l_osd_op_rw_process_lat,
   l_osd_op_rw_prepare_lat,
@@ -640,7 +638,7 @@ public:
     utime_t sched_time;
     /// the hard upper bound of scrub time
     utime_t deadline;
-    ScrubJob() {}
+    ScrubJob() : cct(nullptr) {}
     explicit ScrubJob(CephContext* cct, const spg_t& pg,
 		      const utime_t& timestamp,
 		      double pool_scrub_min_interval = 0,
@@ -685,6 +683,22 @@ public:
       return false;
     *out = *iter;
     return true;
+  }
+
+  void dumps_scrub(Formatter *f) {
+    assert(f != nullptr);
+    Mutex::Locker l(sched_scrub_lock);
+
+    f->open_array_section("scrubs");
+    for (const auto &i: sched_scrub_pg) {
+      f->open_object_section("scrub");
+      f->dump_stream("pgid") << i.pgid;
+      f->dump_stream("sched_time") << i.sched_time;
+      f->dump_stream("deadline") << i.deadline;
+      f->dump_bool("forced", i.sched_time == i.deadline);
+      f->close_section();
+    }
+    f->close_section();
   }
 
   bool can_inc_scrubs_pending();
@@ -975,7 +989,7 @@ public:
       }
     }
   }
-  // replay / delayed pg activation
+  // delayed pg activation
   void queue_for_recovery(PG *pg, bool front = false) {
     Mutex::Locker l(recovery_lock);
     if (front) {
@@ -2313,10 +2327,6 @@ protected:
   void do_recovery(PG *pg, epoch_t epoch_queued, uint64_t pushes_reserved,
 		   ThreadPool::TPHandle &handle);
 
-  Mutex replay_queue_lock;
-  list< pair<spg_t, utime_t > > replay_queue;
-  
-  void check_replay_queue();
 
   // -- scrubbing --
   void sched_scrub();

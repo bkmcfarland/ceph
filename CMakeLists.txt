@@ -219,7 +219,6 @@ endif(${WITH_XFS})
 
 option(WITH_SPDK "Enable SPDK" OFF)
 if(WITH_SPDK)
-  find_package(pciaccess REQUIRED)
   find_package(dpdk REQUIRED)
   set(HAVE_SPDK TRUE)
 endif(WITH_SPDK)
@@ -319,7 +318,7 @@ if(USE_NSS)
 else(USE_NSS)
   #openssl
   find_package(OpenSSL REQUIRED)
-  set(HAVE_OPENSSL ON)
+  set(USE_OPENSSL ON)
   set(SSL_LIBRARIES ${OPENSSL_LIBRARIES})
   message(STATUS "SSL with OpenSSL selected (Libs: ${SSL_LIBRARIES})")
 endif(USE_NSS)
@@ -345,6 +344,47 @@ endif(WITH_RADOSGW)
 
 option(WITH_RADOSGW_ASIO_FRONTEND "Rados Gateway's ASIO frontend is enabled" ON)
 
+if (WITH_RADOSGW)
+  if (NOT DEFINED OPENSSL_FOUND)
+    message(STATUS "Looking for openssl anyways, because radosgw selected")
+    find_package(OpenSSL)
+  endif()
+  if (OPENSSL_FOUND)
+    execute_process(
+      COMMAND
+	"sh" "-c"
+	"objdump -p ${OPENSSL_SSL_LIBRARY} | sed -n 's/^  SONAME  *//p'"
+      OUTPUT_VARIABLE LIBSSL_SONAME
+      ERROR_VARIABLE OBJDUMP_ERRORS
+      RESULT_VARIABLE OBJDUMP_RESULTS
+      OUTPUT_STRIP_TRAILING_WHITESPACE)
+    if (OBJDUMP_RESULTS)
+      message(FATAL_ERROR "can't run objdump: ${OBJDUMP_RESULTS}")
+    endif()
+    if (NOT OBJDUMP_ERRORS STREQUAL "")
+      message(WARNING "message from objdump: ${OBJDUMP_ERRORS}")
+    endif()
+    execute_process(
+      COMMAND
+	"sh" "-c"
+	"objdump -p ${OPENSSL_CRYPTO_LIBRARY} | sed -n 's/^  SONAME  *//p'"
+      OUTPUT_VARIABLE LIBCRYPTO_SONAME
+      ERROR_VARIABLE OBJDUMP_ERRORS
+      RESULT_VARIABLE OBJDUMP_RESULTS
+      OUTPUT_STRIP_TRAILING_WHITESPACE)
+    if (OBJDUMP_RESULTS)
+      message(FATAL_ERROR "can't run objdump: ${OBJDUMP_RESULTS}")
+    endif()
+    if (NOT OBJDUMP_ERRORS STREQUAL "")
+      message(WARNING "message from objdump: ${OBJDUMP_ERRORS}")
+    endif()
+    message(STATUS "ssl soname: ${LIBSSL_SONAME}")
+    message(STATUS "crypto soname: ${LIBCRYPTO_SONAME}")
+  else()
+    message(WARNING "ssl not found: rgw civetweb may fail to dlopen libssl libcrypto")
+  endif()
+endif (WITH_RADOSGW)
+
 #option for CephFS
 option(WITH_CEPHFS "CephFS is enabled" ON)
 
@@ -352,6 +392,7 @@ option(WITH_CEPHFS "CephFS is enabled" ON)
 option(WITH_MGR "ceph-mgr is enabled" ON)
 if(WITH_MGR)
     set(Python_ADDITIONAL_VERSIONS 2.7)
+    find_package(PythonInterp 2.7 REQUIRED)
     find_package(PythonLibs 2.7 REQUIRED)
     # Boost dependency check deferred to Boost section
 endif(WITH_MGR)
@@ -476,10 +517,6 @@ endif()
 find_package(Boost 1.61 COMPONENTS ${BOOST_COMPONENTS} REQUIRED)
 include_directories(SYSTEM ${Boost_INCLUDE_DIRS})
 include_directories(SYSTEM ${PROJECT_BINARY_DIR}/include)
-
-if (NOT WITH_SYSTEM_BOOST)
-  LIST(APPEND Boost_LIBRARIES "-lz")
-endif()
 
 CHECK_INCLUDE_FILE_CXX("boost/asio/coroutine.hpp" HAVE_BOOST_ASIO_COROUTINE)
 

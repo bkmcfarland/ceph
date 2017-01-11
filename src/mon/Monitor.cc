@@ -107,12 +107,6 @@ MonCommand mon_commands[] = {
   {parsesig, helptext, modulename, req_perms, avail, flags},
 #include <mon/MonCommands.h>
 };
-#undef COMMAND
-MonCommand classic_mon_commands[] = {
-#define COMMAND(parsesig, helptext, modulename, req_perms, avail)	\
-  {parsesig, helptext, modulename, req_perms, avail},
-#include <mon/DumplingMonCommands.h>
-};
 
 
 long parse_pos_long(const char *s, ostream *pss)
@@ -259,8 +253,7 @@ Monitor::~Monitor()
   delete paxos;
   assert(session_map.sessions.empty());
   delete mon_caps;
-  if (leader_supported_mon_commands != mon_commands &&
-      leader_supported_mon_commands != classic_mon_commands)
+  if (leader_supported_mon_commands != mon_commands)
     delete[] leader_supported_mon_commands;
 }
 
@@ -540,7 +533,7 @@ void Monitor::read_features_off_disk(MonitorDBStore *store, CompatSet *features)
     *features = get_legacy_features();
 
     features->encode(featuresbl);
-    MonitorDBStore::TransactionRef t(new MonitorDBStore::Transaction);
+    auto t(std::make_shared<MonitorDBStore::Transaction>());
     t->put(MONITOR_NAME, COMPAT_SET_LOC, featuresbl);
     store->apply_transaction(t);
   } else {
@@ -956,8 +949,6 @@ int Monitor::init()
   int cmdsize;
   get_locally_supported_monitor_commands(&cmds, &cmdsize);
   MonCommand::encode_array(cmds, cmdsize, supported_commands_bl);
-  get_classic_monitor_commands(&cmds, &cmdsize);
-  MonCommand::encode_array(cmds, cmdsize, classic_commands_bl);
 
   return 0;
 }
@@ -1341,7 +1332,7 @@ void Monitor::sync_start(entity_inst_t &other, bool full)
 
   if (sync_full) {
     // stash key state, and mark that we are syncing
-    MonitorDBStore::TransactionRef t(new MonitorDBStore::Transaction);
+    auto t(std::make_shared<MonitorDBStore::Transaction>());
     sync_stash_critical_state(t);
     t->put("mon_sync", "in_sync", 1);
 
@@ -1405,7 +1396,7 @@ void Monitor::sync_finish(version_t last_committed)
 
   if (sync_full) {
     // finalize the paxos commits
-    MonitorDBStore::TransactionRef tx(new MonitorDBStore::Transaction);
+    auto tx(std::make_shared<MonitorDBStore::Transaction>());
     paxos->read_and_prepare_transactions(tx, sync_start_version,
 					 last_committed);
     tx->put(paxos->get_name(), "last_committed", last_committed);
@@ -1421,7 +1412,7 @@ void Monitor::sync_finish(version_t last_committed)
 
   assert(g_conf->mon_sync_requester_kill_at != 8);
 
-  MonitorDBStore::TransactionRef t(new MonitorDBStore::Transaction);
+  auto t(std::make_shared<MonitorDBStore::Transaction>());
   t->erase("mon_sync", "in_sync");
   t->erase("mon_sync", "force_sync");
   t->erase("mon_sync", "last_committed_floor");
@@ -1560,7 +1551,7 @@ void Monitor::handle_sync_get_chunk(MonOpRequestRef op)
   }
 
   MMonSync *reply = new MMonSync(MMonSync::OP_CHUNK, sp.cookie);
-  MonitorDBStore::TransactionRef tx(new MonitorDBStore::Transaction);
+  auto tx(std::make_shared<MonitorDBStore::Transaction>());
 
   int left = g_conf->mon_sync_max_payload_size;
   while (sp.last_committed < paxos->get_version() && left > 0) {
@@ -1654,7 +1645,7 @@ void Monitor::handle_sync_chunk(MonOpRequestRef op)
   assert(state == STATE_SYNCHRONIZING);
   assert(g_conf->mon_sync_requester_kill_at != 5);
 
-  MonitorDBStore::TransactionRef tx(new MonitorDBStore::Transaction);
+  auto tx(std::make_shared<MonitorDBStore::Transaction>());
   tx->append_from_encoded(m->chunk_bl);
 
   dout(30) << __func__ << " tx dump:\n";
@@ -1669,7 +1660,7 @@ void Monitor::handle_sync_chunk(MonOpRequestRef op)
 
   if (!sync_full) {
     dout(10) << __func__ << " applying recent paxos transactions as we go" << dendl;
-    MonitorDBStore::TransactionRef tx(new MonitorDBStore::Transaction);
+    auto tx(std::make_shared<MonitorDBStore::Transaction>());
     paxos->read_and_prepare_transactions(tx, paxos->get_version() + 1,
 					 m->last_committed);
     tx->put(paxos->get_name(), "last_committed", m->last_committed);
@@ -2016,7 +2007,7 @@ void Monitor::win_standalone_election()
   win_election(elector.get_epoch(), q,
                CEPH_FEATURES_ALL,
                ceph::features::mon::get_supported(),
-               my_cmds, cmdsize, NULL);
+               my_cmds, cmdsize);
 }
 
 const utime_t& Monitor::get_leader_since() const
@@ -2044,8 +2035,7 @@ void Monitor::_finish_svc_election()
 
 void Monitor::win_election(epoch_t epoch, set<int>& active, uint64_t features,
                            const mon_feature_t& mon_features,
-                           const MonCommand *cmdset, int cmdsize,
-                           const set<int> *classic_monitors)
+                           const MonCommand *cmdset, int cmdsize)
 {
   dout(10) << __func__ << " epoch " << epoch << " quorum " << active
 	   << " features " << features
@@ -2064,8 +2054,6 @@ void Monitor::win_election(epoch_t epoch, set<int>& active, uint64_t features,
 		<< " won leader election with quorum " << quorum << "\n";
 
   set_leader_supported_commands(cmdset, cmdsize);
-  if (classic_monitors)
-    classic_mons = *classic_monitors;
 
   paxos->leader_init();
   // NOTE: tell monmap monitor first.  This is important for the
@@ -2238,7 +2226,7 @@ void Monitor::sync_force(Formatter *f, ostream& ss)
     free_formatter = true;
   }
 
-  MonitorDBStore::TransactionRef tx(new MonitorDBStore::Transaction);
+  auto tx(std::make_shared<MonitorDBStore::Transaction>());
   sync_stash_critical_state(tx);
   tx->put("mon_sync", "force_sync", 1);
   store->apply_transaction(tx);
@@ -2797,15 +2785,9 @@ void Monitor::get_locally_supported_monitor_commands(const MonCommand **cmds,
   *cmds = mon_commands;
   *count = ARRAY_SIZE(mon_commands);
 }
-void Monitor::get_classic_monitor_commands(const MonCommand **cmds, int *count)
-{
-  *cmds = classic_mon_commands;
-  *count = ARRAY_SIZE(classic_mon_commands);
-}
 void Monitor::set_leader_supported_commands(const MonCommand *cmds, int size)
 {
-  if (leader_supported_mon_commands != mon_commands &&
-      leader_supported_mon_commands != classic_mon_commands)
+  if (leader_supported_mon_commands != mon_commands)
     delete[] leader_supported_mon_commands;
   leader_supported_mon_commands = cmds;
   leader_supported_mon_commands_size = size;
@@ -5181,7 +5163,7 @@ int Monitor::check_fsid()
 
 int Monitor::write_fsid()
 {
-  MonitorDBStore::TransactionRef t(new MonitorDBStore::Transaction);
+  auto t(std::make_shared<MonitorDBStore::Transaction>());
   write_fsid(t);
   int r = store->apply_transaction(t);
   return r;
@@ -5206,7 +5188,7 @@ int Monitor::write_fsid(MonitorDBStore::TransactionRef t)
  */
 int Monitor::mkfs(bufferlist& osdmapbl)
 {
-  MonitorDBStore::TransactionRef t(new MonitorDBStore::Transaction);
+  auto t(std::make_shared<MonitorDBStore::Transaction>());
 
   // verify cluster fsid
   int r = check_fsid();

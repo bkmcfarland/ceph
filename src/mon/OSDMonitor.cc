@@ -80,7 +80,6 @@ OSDMonitor::OSDMonitor(CephContext *cct, Monitor *mn, Paxos *p, const string& se
    cct(cct),
    inc_osd_cache(g_conf->mon_osd_cache_size),
    full_osd_cache(g_conf->mon_osd_cache_size),
-   thrash_map(0), thrash_last_up_osd(-1),
    op_tracker(cct, true, 1)
 {}
 
@@ -165,16 +164,6 @@ void OSDMonitor::update_from_paxos(bool *need_bootstrap)
   if (latest_full == 0 && get_first_committed() > 1)
     latest_full = get_first_committed();
 
-  if (latest_full > 0) {
-    // make sure we can really believe get_version_latest_full(); see
-    // 76cd7ac1c2094b34ad36bea89b2246fa90eb2f6d
-    bufferlist test;
-    get_version_full(latest_full, test);
-    if (test.length() == 0) {
-      dout(10) << __func__ << " ignoring recorded latest_full as it is missing; fallback to search" << dendl;
-      latest_full = 0;
-    }
-  }
   if (get_first_committed() > 1 &&
       latest_full < get_first_committed()) {
     /* a bug introduced in 7fb3804fb860dcd0340dd3f7c39eec4315f8e4b6 would lead
@@ -202,7 +191,7 @@ void OSDMonitor::update_from_paxos(bool *need_bootstrap)
     // state, and we shouldn't want to work around it without knowing what
     // exactly happened.
     assert(latest_full > 0);
-    MonitorDBStore::TransactionRef t(new MonitorDBStore::Transaction);
+    auto t(std::make_shared<MonitorDBStore::Transaction>());
     put_version_latest_full(t, latest_full);
     mon->store->apply_transaction(t);
     dout(10) << __func__ << " updated the on-disk full map version to "
@@ -346,115 +335,9 @@ void OSDMonitor::update_msgr_features()
   }
 }
 
-bool OSDMonitor::thrash()
-{
-  if (!thrash_map)
-    return false;
-
-  thrash_map--;
-  int o;
-
-  int osd_num = osdmap.get_num_osds();
-  if (osd_num == 0)
-    return false;
-
-  // mark a random osd up_thru..
-  if (rand() % 4 == 0 || thrash_last_up_osd < 0)
-    o = rand() % osd_num;
-  else
-    o = thrash_last_up_osd;
-  if (osdmap.is_up(o)) {
-    dout(5) << "thrash_map osd." << o << " up_thru" << dendl;
-    pending_inc.new_up_thru[o] = osdmap.get_epoch();
-  }
-
-  // mark a random osd up/down
-  o = rand() % osd_num;
-  if (osdmap.is_up(o)) {
-    dout(5) << "thrash_map osd." << o << " down" << dendl;
-    pending_inc.new_state[o] = CEPH_OSD_UP;
-  } else if (osdmap.exists(o)) {
-    dout(5) << "thrash_map osd." << o << " up" << dendl;
-    pending_inc.new_state[o] = CEPH_OSD_UP;
-    pending_inc.new_up_client[o] = entity_addr_t();
-    pending_inc.new_up_cluster[o] = entity_addr_t();
-    pending_inc.new_hb_back_up[o] = entity_addr_t();
-    pending_inc.new_weight[o] = CEPH_OSD_IN;
-    thrash_last_up_osd = o;
-  }
-
-  // mark a random osd in
-  o = rand() % osd_num;
-  if (osdmap.exists(o)) {
-    dout(5) << "thrash_map osd." << o << " in" << dendl;
-    pending_inc.new_weight[o] = CEPH_OSD_IN;
-  }
-
-  // mark a random osd out
-  o = rand() % osd_num;
-  if (osdmap.exists(o)) {
-    dout(5) << "thrash_map osd." << o << " out" << dendl;
-    pending_inc.new_weight[o] = CEPH_OSD_OUT;
-  }
-
-  // generate some pg_temp entries.
-  // let's assume the ceph::unordered_map iterates in a random-ish order.
-  int pg_num = mon->pgmon()->pg_map.pg_stat.size();
-  if (pg_num == 0)
-    return true;
-  int n = rand() % pg_num;
-  ceph::unordered_map<pg_t,pg_stat_t>::iterator p = mon->pgmon()->pg_map.pg_stat.begin();
-  ceph::unordered_map<pg_t,pg_stat_t>::iterator e = mon->pgmon()->pg_map.pg_stat.end();
-  while (n--)
-    ++p;
-
-  for (int i = std::min(pg_num, 50); i > 0; i--) {
-    unsigned size = osdmap.get_pg_size(p->first);
-    vector<int> v;
-    bool have_real_osd = false;
-    for (int j=0; j < (int)size; j++) {
-      o = rand() % osd_num;
-      if (osdmap.exists(o) && std::find(v.begin(), v.end(), o) == v.end()) {
-	have_real_osd = true;
-	v.push_back(o);
-      }
-    }
-    for (vector<int>::iterator q = p->second.acting.begin();
-	 q != p->second.acting.end() && v.size() < size;
-	 ++q) {
-      if (std::find(v.begin(), v.end(), *q) == v.end()) {
-	if (*q != CRUSH_ITEM_NONE)
-	  have_real_osd = true;
-	v.push_back(*q);
-      }
-    }
-    if (osdmap.pg_is_ec(p->first)) {
-      while (v.size() < size)
-	v.push_back(CRUSH_ITEM_NONE);
-    }
-    if (!v.empty() && have_real_osd)
-      pending_inc.new_pg_temp[p->first] = v;
-    dout(5) << "thrash_map pg " << p->first << " pg_temp remapped to " << v << dendl;
-
-    ++p;
-    if (p == e)
-      p = mon->pgmon()->pg_map.pg_stat.begin();
-  }
-  return true;
-}
-
 void OSDMonitor::on_active()
 {
   update_logger();
-
-  if (thrash_map) {
-    if (mon->is_leader()) {
-      if (thrash())
-	propose_pending();
-    } else {
-      thrash_map = 0;
-    }
-  }
 
   if (mon->is_leader())
     mon->clog->info() << "osdmap " << osdmap << "\n";
@@ -3167,7 +3050,7 @@ void OSDMonitor::dump_info(Formatter *f)
 namespace {
   enum osd_pool_get_choices {
     SIZE, MIN_SIZE, CRASH_REPLAY_INTERVAL,
-    PG_NUM, PGP_NUM, CRUSH_RULESET, HASHPSPOOL,
+    PG_NUM, PGP_NUM, CRUSH_RULE, CRUSH_RULESET, HASHPSPOOL,
     NODELETE, NOPGCHANGE, NOSIZECHANGE,
     WRITE_FADVISE_DONTNEED, NOSCRUB, NODEEP_SCRUB,
     HIT_SET_TYPE, HIT_SET_PERIOD, HIT_SET_COUNT, HIT_SET_FPP,
@@ -3652,7 +3535,9 @@ bool OSDMonitor::preprocess_command(MonOpRequestRef op)
       {"size", SIZE},
       {"min_size", MIN_SIZE},
       {"crash_replay_interval", CRASH_REPLAY_INTERVAL},
-      {"pg_num", PG_NUM}, {"pgp_num", PGP_NUM}, {"crush_ruleset", CRUSH_RULESET},
+      {"pg_num", PG_NUM}, {"pgp_num", PGP_NUM},
+      {"crush_rule", CRUSH_RULE},
+      {"crush_ruleset", CRUSH_RULESET},
       {"hashpspool", HASHPSPOOL}, {"nodelete", NODELETE},
       {"nopgchange", NOPGCHANGE}, {"nosizechange", NOSIZECHANGE},
       {"noscrub", NOSCRUB}, {"nodeep-scrub", NODEEP_SCRUB},
@@ -3769,6 +3654,14 @@ bool OSDMonitor::preprocess_command(MonOpRequestRef op)
 	  case CRASH_REPLAY_INTERVAL:
 	    f->dump_int("crash_replay_interval",
 			p->get_crash_replay_interval());
+	    break;
+	  case CRUSH_RULE:
+	    if (osdmap.crush->rule_exists(p->get_crush_ruleset())) {
+	      f->dump_string("crush_rule", osdmap.crush->get_rule_name(
+			       p->get_crush_ruleset()));
+	    } else {
+	      f->dump_string("crush_rule", stringify(p->get_crush_ruleset()));
+	    }
 	    break;
 	  case CRUSH_RULESET:
 	    f->dump_int("crush_ruleset", p->get_crush_ruleset());
@@ -3925,6 +3818,14 @@ bool OSDMonitor::preprocess_command(MonOpRequestRef op)
 	  case CRASH_REPLAY_INTERVAL:
 	    ss << "crash_replay_interval: " <<
 	      p->get_crash_replay_interval() << "\n";
+	    break;
+	  case CRUSH_RULE:
+	    if (osdmap.crush->rule_exists(p->get_crush_ruleset())) {
+	      ss << "crush_rule: " << osdmap.crush->get_rule_name(
+		p->get_crush_ruleset()) << "\n";
+	    } else {
+	      ss << "crush_rule: " << p->get_crush_ruleset() << "\n";
+	    }
 	    break;
 	  case CRUSH_RULESET:
 	    ss << "crush_ruleset: " << p->get_crush_ruleset() << "\n";
@@ -5107,34 +5008,6 @@ int OSDMonitor::parse_osd_id(const char *s, stringstream *pss)
 }
 
 
-/**
- * Special setter for crash_replay_interval on a pool.  Equivalent to
- * using prepare_command_pool_set, but in a form convenient for use
- * from MDSMonitor rather than from an administrative command.
- */
-int OSDMonitor::set_crash_replay_interval(const int64_t pool_id, const uint32_t cri)
-{
-  pg_pool_t p;
-  if (pending_inc.new_pools.count(pool_id)) {
-    p = pending_inc.new_pools[pool_id];
-  } else {
-    const pg_pool_t *p_ptr = osdmap.get_pg_pool(pool_id);
-    if (p_ptr == NULL) {
-      return -ENOENT;
-    } else {
-      p = *p_ptr;
-    }
-  }
-
-  dout(10) << "Set pool " << pool_id << " crash_replay_interval=" << cri << dendl;
-  p.crash_replay_interval = cri;
-  p.last_change = pending_inc.epoch;
-  pending_inc.new_pools[pool_id] = p;
-
-  return 0;
-}
-
-
 int OSDMonitor::prepare_command_pool_set(map<string,cmd_vartype> &cmdmap,
                                          stringstream& ss)
 {
@@ -5282,14 +5155,6 @@ int OSDMonitor::prepare_command_pool_set(map<string,cmd_vartype> &cmdmap,
 	 << ')';
       return -E2BIG;
     }
-    for(set<pg_t>::iterator i = mon->pgmon()->pg_map.creating_pgs.begin();
-	i != mon->pgmon()->pg_map.creating_pgs.end();
-	++i) {
-      if (i->m_pool == static_cast<uint64_t>(pool)) {
-	ss << "currently creating pgs, wait";
-	return -EBUSY;
-      }
-    }
     p.set_pg_num(n);
   } else if (var == "pgp_num") {
     if (p.has_flag(pg_pool_t::FLAG_NOPGCHANGE)) {
@@ -5308,15 +5173,21 @@ int OSDMonitor::prepare_command_pool_set(map<string,cmd_vartype> &cmdmap,
       ss << "specified pgp_num " << n << " > pg_num " << p.get_pg_num();
       return -EINVAL;
     }
-    for(set<pg_t>::iterator i = mon->pgmon()->pg_map.creating_pgs.begin();
-	i != mon->pgmon()->pg_map.creating_pgs.end();
-	++i) {
-      if (i->m_pool == static_cast<uint64_t>(pool)) {
-	ss << "currently creating pgs, wait";
-	return -EBUSY;
-      }
-    }
     p.set_pgp_num(n);
+  } else if (var == "crush_rule") {
+    int id = osdmap.crush->get_rule_id(val);
+    if (id == -ENOENT) {
+      ss << "crush rule " << val << " does not exist";
+      return -ENOENT;
+    }
+    if (id < 0) {
+      ss << cpp_strerror(id);
+      return -ENOENT;
+    }
+    if (!osdmap.crush->check_crush_rule(id, p.get_type(), p.get_size(), ss)) {
+      return -EINVAL;
+    }
+    p.crush_ruleset = id;
   } else if (var == "crush_ruleset") {
     if (interr.length()) {
       ss << "error parsing integer value '" << val << "': " << interr;
@@ -6733,8 +6604,7 @@ bool OSDMonitor::prepare_command_impl(MonOpRequestRef op,
       err = -EINVAL;
       goto reply;
     }
-    PGMap& pg_map = mon->pgmon()->pg_map;
-    if (!pg_map.pg_stat.count(pgid)) {
+    if (!osdmap.pg_exists(pgid)) {
       ss << "pg " << pgid << " does not exist";
       err = -ENOENT;
       goto reply;
@@ -7562,6 +7432,8 @@ done:
     np->read_tier = overlaypool_id;
     np->write_tier = overlaypool_id;
     np->last_force_op_resend = pending_inc.epoch;
+    pg_pool_t *noverlay_p = pending_inc.get_new_pool(overlaypool_id, overlay_p);
+    noverlay_p->last_force_op_resend = pending_inc.epoch;
     ss << "overlay for '" << poolstr << "' is now (or already was) '" << overlaypoolstr << "'";
     if (overlay_p->cache_mode == pg_pool_t::CACHEMODE_NONE)
       ss <<" (WARNING: overlay pool cache_mode is still NONE)";
@@ -7592,6 +7464,16 @@ done:
 
     // go
     pg_pool_t *np = pending_inc.get_new_pool(pool_id, p);
+    if (np->has_read_tier()) {
+      const pg_pool_t *op = osdmap.get_pg_pool(np->read_tier);
+      pg_pool_t *nop = pending_inc.get_new_pool(np->read_tier,op);
+      nop->last_force_op_resend = pending_inc.epoch;
+    }
+    if (np->has_write_tier()) {
+      const pg_pool_t *op = osdmap.get_pg_pool(np->write_tier);
+      pg_pool_t *nop = pending_inc.get_new_pool(np->write_tier, op);
+      nop->last_force_op_resend = pending_inc.epoch;
+    }
     np->clear_read_tier();
     np->clear_write_tier();
     np->last_force_op_resend = pending_inc.epoch;
@@ -7828,6 +7710,8 @@ done:
     np->tiers.insert(tierpool_id);
     np->read_tier = np->write_tier = tierpool_id;
     np->set_snap_epoch(pending_inc.epoch); // tier will update to our snap info
+    np->last_force_op_resend = pending_inc.epoch;
+    ntp->last_force_op_resend = pending_inc.epoch;
     ntp->tier_of = pool_id;
     ntp->cache_mode = mode;
     ntp->hit_set_count = g_conf->osd_tier_default_cache_hit_set_count;
@@ -7948,16 +7832,6 @@ done:
 	new Monitor::C_Command(mon, op, 0, rs, rdata, get_last_committed() + 1));
       return true;
     }
-  } else if (prefix == "osd thrash") {
-    int64_t num_epochs;
-    cmd_getval(g_ceph_context, cmdmap, "num_epochs", num_epochs, int64_t(0));
-    // thrash_map is a member var
-    thrash_map = num_epochs;
-    ss << "will thrash map for " << thrash_map << " epochs";
-    ret = thrash();
-    err = 0;
-    if (ret)
-      goto update;
   } else {
     err = -EINVAL;
   }

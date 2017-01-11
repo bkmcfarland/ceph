@@ -2365,10 +2365,12 @@ BlueStore::BlobRef BlueStore::ExtentMap::split_blob(
 
 void BlueStore::Onode::flush()
 {
-  std::unique_lock<std::mutex> l(flush_lock);
-  ldout(c->store->cct, 20) << __func__ << " " << flush_txns << dendl;
-  while (!flush_txns.empty())
-    flush_cond.wait(l);
+  if (flushing_count) {
+    std::unique_lock<std::mutex> l(flush_lock);
+    ldout(c->store->cct, 20) << __func__ << " " << flush_txns << dendl;
+    while (!flush_txns.empty())
+      flush_cond.wait(l);
+  }
   ldout(c->store->cct, 20) << __func__ << " done" << dendl;
 }
 
@@ -3715,18 +3717,17 @@ int BlueStore::_balance_bluefs_freespace(vector<bluestore_pextent_t> *extents)
 	     << " (" << pretty_si_t(reclaim) << ")" << dendl;
 
     while (reclaim > 0) {
-      uint64_t offset = 0;
-      uint32_t length = 0;
-
       // NOTE: this will block and do IO.
+      AllocExtentVector extents;
       int r = bluefs->reclaim_blocks(bluefs_shared_bdev, reclaim,
-				   &offset, &length);
+				     &extents);
       assert(r >= 0);
 
-      bluefs_extents.erase(offset, length);
-      bluefs_extents_reclaiming.insert(offset, length);
-
-      reclaim -= length;
+      for (auto e : extents) {
+	bluefs_extents.erase(e.offset, e.length);
+	bluefs_extents_reclaiming.insert(e.offset, e.length);
+	reclaim -= e.length;
+      }
     }
 
     ret = 1;
@@ -6500,6 +6501,7 @@ void BlueStore::_txc_write_nodes(TransContext *txc, KeyValueDB::Transaction t)
 
     std::lock_guard<std::mutex> l(o->flush_lock);
     o->flush_txns.insert(txc);
+    o->flushing_count++;
   }
 
   // objects we modified but didn't affect the onode
@@ -6508,6 +6510,7 @@ void BlueStore::_txc_write_nodes(TransContext *txc, KeyValueDB::Transaction t)
     if (txc->onodes.count(*p) == 0) {
       std::lock_guard<std::mutex> l((*p)->flush_lock);
       (*p)->flush_txns.insert(txc);
+      (*p)->flushing_count++;
       ++p;
     } else {
       // remove dups with onodes list to avoid problems in _txc_finish
@@ -6552,12 +6555,10 @@ void BlueStore::_txc_finish_kv(TransContext *txc)
     finishers[n]->queue(txc->onreadable);
     txc->onreadable = NULL;
   }
-  while (!txc->oncommits.empty()) {
-    auto f = txc->oncommits.front();
-    finishers[n]->queue(f);
-    txc->oncommits.pop_front();
-  }
 
+  if (!txc->oncommits.empty()) {
+    finishers[n]->queue(txc->oncommits);
+  }
   op_queue_release_throttle(txc);
 }
 
@@ -6584,6 +6585,7 @@ void BlueStore::_txc_finish(TransContext *txc)
 	       << dendl;
       assert(o->flush_txns.count(txc));
       o->flush_txns.erase(txc);
+      o->flushing_count--;
       if (o->flush_txns.empty()) {
 	o->flush_cond.notify_all();
       }
@@ -6832,6 +6834,7 @@ void BlueStore::_kv_sync_thread()
       }
       while (!wal_cleaning.empty()) {
 	TransContext *txc = wal_cleaning.front();
+	_txc_release_alloc(txc);
 	_txc_state_proc(txc);
 	wal_cleaning.pop_front();
       }
@@ -7511,12 +7514,10 @@ void BlueStore::_dump_extent_map(ExtentMap &em, int log_level)
 		      << dendl;
     }
     std::lock_guard<std::recursive_mutex> l(e.blob->shared_blob->bc.cache->lock);
-    if (!e.blob->shared_blob->bc.empty()) {
-      for (auto& i : e.blob->shared_blob->bc.buffer_map) {
-	dout(log_level) << __func__ << "       0x" << std::hex << i.first
-			<< "~" << i.second->length << std::dec
-			<< " " << *i.second << dendl;
-      }
+    for (auto& i : e.blob->shared_blob->bc.buffer_map) {
+      dout(log_level) << __func__ << "       0x" << std::hex << i.first
+                      << "~" << i.second->length << std::dec
+                      << " " << *i.second << dendl;
     }
   }
 }

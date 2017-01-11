@@ -66,7 +66,7 @@ void MonmapMonitor::update_from_paxos(bool *need_bootstrap)
   mon->monmap->decode(monmap_bl);
 
   if (mon->store->exists("mkfs", "monmap")) {
-    MonitorDBStore::TransactionRef t(new MonitorDBStore::Transaction);
+    auto t(std::make_shared<MonitorDBStore::Transaction>());
     t->erase("mkfs", "monmap");
     mon->store->apply_transaction(t);
   }
@@ -161,7 +161,7 @@ void MonmapMonitor::on_active()
        single-threaded process and, truth be told, no one else relies on this
        thing besides us.
      */
-    MonitorDBStore::TransactionRef t(new MonitorDBStore::Transaction);
+    auto t(std::make_shared<MonitorDBStore::Transaction>());
     t->put(Monitor::MONITOR_NAME, "joined", 1);
     mon->store->apply_transaction(t);
     mon->has_ever_joined = true;
@@ -590,21 +590,6 @@ void MonmapMonitor::get_health(list<pair<health_status_t, string> >& summary,
 	     << " is down (out of quorum)";
 	  detail->push_back(make_pair(HEALTH_WARN, ss.str()));
 	}
-      }
-    }
-  }
-  if (g_conf->mon_warn_on_old_mons && !mon->get_classic_mons().empty()) {
-    ostringstream ss;
-    ss << "some monitors are running older code";
-    summary.push_back(make_pair(HEALTH_WARN, ss.str()));
-    if (detail) {
-      for (set<int>::const_iterator i = mon->get_classic_mons().begin();
-	  i != mon->get_classic_mons().end();
-	  ++i) {
-	ostringstream ss;
-	ss << "mon." << mon->monmap->get_name(*i)
-	     << " only supports the \"classic\" command set";
-	detail->push_back(make_pair(HEALTH_WARN, ss.str()));
       }
     }
   }

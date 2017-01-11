@@ -73,7 +73,7 @@ static ostream& _prefix(std::ostream *_dout, T *pg) {
 
 MEMPOOL_DEFINE_OBJECT_FACTORY(PrimaryLogPG, replicatedpg, osd);
 
-PGLSFilter::PGLSFilter()
+PGLSFilter::PGLSFilter() : cct(nullptr)
 {
 }
 
@@ -1637,12 +1637,6 @@ void PrimaryLogPG::do_request(
       op->mark_delayed("waiting for active");
       return;
     }
-    if (is_replay()) {
-      dout(20) << " replay, waiting for active on " << op << dendl;
-      waiting_for_active.push_back(op);
-      op->mark_delayed("waiting for replay end");
-      return;
-    }
     // verify client features
     if ((pool.info.has_tiers() || pool.info.is_tier()) &&
 	!op->has_feature(CEPH_FEATURE_OSD_CACHEPOOL)) {
@@ -1955,38 +1949,27 @@ void PrimaryLogPG::do_op(OpRequestRef& op)
     return;
   }
 
-  // dup/replay?
+  // dup/resent?
   if (op->may_write() || op->may_cache()) {
     // warning: we will get back *a* request for this reqid, but not
     // necessarily the most recent.  this happens with flush and
     // promote ops, but we can't possible have both in our log where
     // the original request is still not stable on disk, so for our
     // purposes here it doesn't matter which one we get.
-    eversion_t replay_version;
+    eversion_t version;
     version_t user_version;
     int return_code = 0;
     bool got = check_in_progress_op(
-      m->get_reqid(), &replay_version, &user_version, &return_code);
+      m->get_reqid(), &version, &user_version, &return_code);
     if (got) {
       dout(3) << __func__ << " dup " << m->get_reqid()
-	      << " was " << replay_version << dendl;
-      if (already_complete(replay_version)) {
-	osd->reply_op_error(op, return_code, replay_version, user_version);
+	      << " version " << version << dendl;
+      if (already_complete(version)) {
+	osd->reply_op_error(op, return_code, version, user_version);
       } else {
-	if (m->wants_ack()) {
-	  if (already_ack(replay_version)) {
-	    MOSDOpReply *reply = new MOSDOpReply(m, 0, get_osdmap()->get_epoch(), 0, false);
-	    reply->add_flags(CEPH_OSD_FLAG_ACK);
-	    reply->set_reply_versions(replay_version, user_version);
-	    osd->send_message_osd_client(reply, m->get_connection());
-	  } else {
-	    dout(10) << " waiting for " << replay_version << " to ack" << dendl;
-	    waiting_for_ack[replay_version].push_back(make_pair(op, user_version));
-	  }
-	}
-	dout(10) << " waiting for " << replay_version << " to commit" << dendl;
+	dout(10) << " waiting for " << version << " to commit" << dendl;
         // always queue ondisk waiters, so that we can requeue if needed
-	waiting_for_ondisk[replay_version].push_back(make_pair(op, user_version));
+	waiting_for_ondisk[version].push_back(make_pair(op, user_version));
 	op->mark_delayed("waiting for ondisk");
       }
       return;
@@ -2904,7 +2887,7 @@ void PrimaryLogPG::do_proxy_write(OpRequestRef op, const hobject_t& missing_oid)
   ceph_tid_t tid = osd->objecter->mutate(
     soid.oid, oloc, obj_op, snapc,
     ceph::real_clock::from_ceph_timespec(pwop->mtime),
-    flags, NULL, new C_OnFinisher(fin, &osd->objecter_finisher),
+    flags, new C_OnFinisher(fin, &osd->objecter_finisher),
     &pwop->user_version, pwop->reqid);
   fin->tid = tid;
   pwop->objecter_tid = tid;
@@ -3262,39 +3245,13 @@ void PrimaryLogPG::execute_ctx(OpContext *ctx)
 
   // no need to capture PG ref, repop cancel will handle that
   // Can capture the ctx by pointer, it's owned by the repop
-  ctx->register_on_applied(
-    [m, ctx, this](){
-      if (m && m->wants_ack() && !ctx->sent_ack && !ctx->sent_disk) {
-	// send ack
-	MOSDOpReply *reply = ctx->reply;
-	if (reply)
-	  ctx->reply = NULL;
-	else {
-	  reply = new MOSDOpReply(m, 0, get_osdmap()->get_epoch(), 0, true);
-	  reply->set_reply_versions(ctx->at_version,
-				    ctx->user_at_version);
-	}
-	reply->add_flags(CEPH_OSD_FLAG_ACK);
-	dout(10) << " sending ack: " << *m << " " << reply << dendl;
-	osd->send_message_osd_client(reply, m->get_connection());
-	ctx->sent_ack = true;
-      }
-
-      // note the write is now readable (for rlatency calc).  note
-      // that this will only be defined if the write is readable
-      // _prior_ to being committed; it will not get set with
-      // writeahead journaling, for instance.
-      if (ctx->readable_stamp == utime_t())
-	ctx->readable_stamp = ceph_clock_now();
-    });
   ctx->register_on_commit(
     [m, ctx, this](){
       if (ctx->op)
 	log_op_stats(
 	  ctx);
 
-      if (m && m->wants_ondisk() && !ctx->sent_disk) {
-	// send commit.
+      if (m && (m->wants_ondisk() || m->wants_ack()) && !ctx->sent_reply) {
 	MOSDOpReply *reply = ctx->reply;
 	if (reply)
 	  ctx->reply = NULL;
@@ -3304,9 +3261,9 @@ void PrimaryLogPG::execute_ctx(OpContext *ctx)
 				    ctx->user_at_version);
 	}
 	reply->add_flags(CEPH_OSD_FLAG_ACK | CEPH_OSD_FLAG_ONDISK);
-	dout(10) << " sending commit on " << *m << " " << reply << dendl;
+	dout(10) << " sending reply on " << *m << " " << reply << dendl;
 	osd->send_message_osd_client(reply, m->get_connection());
-	ctx->sent_disk = true;
+	ctx->sent_reply = true;
 	ctx->op->mark_commit_sent();
       }
     });
@@ -3357,12 +3314,6 @@ void PrimaryLogPG::log_op_stats(OpContext *ctx)
   utime_t process_latency = now;
   process_latency -= ctx->op->get_dequeued_time();
 
-  utime_t rlatency;
-  if (ctx->readable_stamp != utime_t()) {
-    rlatency = ctx->readable_stamp;
-    rlatency -= ctx->op->get_req()->get_recv_stamp();
-  }
-
   uint64_t inb = ctx->bytes_written;
   uint64_t outb = ctx->bytes_read;
 
@@ -3379,8 +3330,6 @@ void PrimaryLogPG::log_op_stats(OpContext *ctx)
     osd->logger->inc(l_osd_op_rw_outb, outb);
     osd->logger->tinc(l_osd_op_rw_lat, latency);
     osd->logger->tinc(l_osd_op_rw_process_lat, process_latency);
-    if (rlatency != utime_t())
-      osd->logger->tinc(l_osd_op_rw_rlat, rlatency);
   } else if (op->may_read()) {
     osd->logger->inc(l_osd_op_r);
     osd->logger->inc(l_osd_op_r_outb, outb);
@@ -3391,15 +3340,12 @@ void PrimaryLogPG::log_op_stats(OpContext *ctx)
     osd->logger->inc(l_osd_op_w_inb, inb);
     osd->logger->tinc(l_osd_op_w_lat, latency);
     osd->logger->tinc(l_osd_op_w_process_lat, process_latency);
-    if (rlatency != utime_t())
-      osd->logger->tinc(l_osd_op_w_rlat, rlatency);
   } else
     ceph_abort();
 
   dout(15) << "log_op_stats " << *m
 	   << " inb " << inb
 	   << " outb " << outb
-	   << " rlat " << rlatency
 	   << " lat " << latency << dendl;
 }
 
@@ -8149,7 +8095,6 @@ int PrimaryLogPG::start_flush(
       (CEPH_OSD_FLAG_IGNORE_OVERLAY |
        CEPH_OSD_FLAG_ORDERSNAP |
        CEPH_OSD_FLAG_ENFORCE_SNAPC),
-      NULL,
       NULL /* no callback, we'll rely on the ordering w.r.t the next op */);
   }
 
@@ -8165,7 +8110,6 @@ int PrimaryLogPG::start_flush(
       (CEPH_OSD_FLAG_IGNORE_OVERLAY |
        CEPH_OSD_FLAG_ORDERSNAP |
        CEPH_OSD_FLAG_ENFORCE_SNAPC),
-      NULL,
       NULL /* no callback, we'll rely on the ordering w.r.t the next op */);
   }
 
@@ -8199,8 +8143,8 @@ int PrimaryLogPG::start_flush(
     soid.oid, base_oloc, o, snapc,
     ceph::real_clock::from_ceph_timespec(oi.mtime),
     CEPH_OSD_FLAG_IGNORE_OVERLAY | CEPH_OSD_FLAG_ENFORCE_SNAPC,
-    NULL, new C_OnFinisher(fin,
-			   &osd->objecter_finisher));
+    new C_OnFinisher(fin,
+		     &osd->objecter_finisher));
   /* we're under the pg lock and fin->finish() is grabbing that */
   fin->tid = tid;
   fop->objecter_tid = tid;
@@ -8545,12 +8489,6 @@ void PrimaryLogPG::eval_repop(RepGather *repop)
 			    i->second);
       }
       waiting_for_ondisk.erase(repop->v);
-    }
-
-    // clear out acks, we sent the commits above
-    if (waiting_for_ack.count(repop->v)) {
-      assert(waiting_for_ack.begin()->first == repop->v);
-      waiting_for_ack.erase(repop->v);
     }
   }
 
@@ -9803,9 +9741,10 @@ void PrimaryLogPG::sub_op_remove(OpRequestRef op)
 eversion_t PrimaryLogPG::pick_newest_available(const hobject_t& oid)
 {
   eversion_t v;
-
-  assert(pg_log.get_missing().is_missing(oid));
-  v = pg_log.get_missing().get_items().find(oid)->second.have;
+  pg_missing_item pmi;
+  bool is_missing = pg_log.get_missing().is_missing(oid, &pmi);
+  assert(is_missing);
+  v = pmi.have;
   dout(10) << "pick_newest_available " << oid << " " << v << " on osd." << osd->whoami << " (local)" << dendl;
 
   assert(!actingbackfill.empty());
@@ -10087,7 +10026,6 @@ void PrimaryLogPG::apply_and_flush_repops(bool requeue)
   }
 
   waiting_for_ondisk.clear();
-  waiting_for_ack.clear();
 }
 
 void PrimaryLogPG::on_flushed()
@@ -11624,7 +11562,6 @@ void PrimaryLogPG::hit_set_clear()
   dout(20) << __func__ << dendl;
   hit_set.reset();
   hit_set_start_stamp = utime_t();
-  hit_set_flushing.clear();
 }
 
 void PrimaryLogPG::hit_set_setup()
@@ -11773,7 +11710,6 @@ void PrimaryLogPG::hit_set_persist()
 
   utime_t now = ceph_clock_now();
   hobject_t oid;
-  time_t flush_time = 0;
 
   // If any archives are degraded we skip this persist request
   // account for the additional entry being added below
@@ -11835,19 +11771,8 @@ void PrimaryLogPG::hit_set_persist()
     hit_set_in_memory_trim(size);
   }
 
-  // hold a ref until it is flushed to disk
-  hit_set_flushing[new_hset.begin] = hit_set;
-  flush_time = new_hset.begin;
-
   ObjectContextRef obc = get_object_context(oid, true);
   OpContextUPtr ctx = simple_opc_create(obc);
-  if (flush_time != 0) {
-    PrimaryLogPGRef pg(this);
-    ctx->register_on_applied(
-      [pg, flush_time]() {
-	pg->hit_set_flushing.erase(flush_time);
-      });
-  }
 
   ctx->at_version = get_next_version();
   ctx->updated_hset_history = info.hit_set;
@@ -12178,12 +12103,6 @@ void PrimaryLogPG::agent_load_hit_sets()
 	  // FIXME: EC not supported here yet
 	  derr << __func__ << " on non-replicated pool" << dendl;
 	  break;
-	}
-
-	// check if it's still in flight
-	if (hit_set_flushing.count(p->begin)) {
-	  agent_state->add_hit_set(p->begin.sec(), hit_set_flushing[p->begin]);
-	  continue;
 	}
 
 	hobject_t oid = get_hit_set_archive_object(p->begin, p->end, p->using_gmt);
@@ -13125,7 +13044,18 @@ void PrimaryLogPG::scrub_snapshot_metadata(
       continue;
     dout(10) << __func__ << " recording digests for " << p->first << dendl;
     ObjectContextRef obc = get_object_context(p->first, false);
-    assert(obc);
+    if (!obc) {
+      osd->clog->error() << info.pgid << " " << mode
+			 << " cannot get object context for "
+			 << p->first;
+      continue;
+    } else if (obc->obs.oi.soid != p->first) {
+      osd->clog->error() << info.pgid << " " << mode
+			 << " object " << p->first
+			 << " has a valid oi attr with a mismatched name, "
+			 << " obc->obs.oi.soid: " << obc->obs.oi.soid;
+      continue;
+    }
     OpContextUPtr ctx = simple_opc_create(obc);
     ctx->at_version = get_next_version();
     ctx->mtime = utime_t();      // do not update mtime

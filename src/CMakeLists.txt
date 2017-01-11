@@ -5,6 +5,12 @@ include(GNUInstallDirs)
 # for erasure and compressor plugins
 set(CMAKE_INSTALL_PKGLIBDIR ${CMAKE_INSTALL_LIBDIR}/${PROJECT_NAME})
 set(CMAKE_INSTALL_FULL_PKGLIBDIR ${CMAKE_INSTALL_FULL_LIBDIR}/${PROJECT_NAME})
+# so libceph-common can be found
+set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
+if(NOT CMAKE_INSTALL_RPATH)
+  set(CMAKE_INSTALL_RPATH "${CMAKE_INSTALL_FULL_PKGLIBDIR}")
+endif()
+
 # to be compatible with configure_files shared with autoconfig
 set(bindir ${CMAKE_INSTALL_FULL_BINDIR})
 set(sbindir ${CMAKE_INSTALL_FULL_SBINDIR})
@@ -424,8 +430,6 @@ set(libcommon_files
   common/TrackedOp.cc
   common/SloppyCRCMap.cc
   common/types.cc
-  $<TARGET_OBJECTS:common_buffer_obj>
-  $<TARGET_OBJECTS:common_texttable_obj>
   log/Log.cc
   log/SubsystemMap.cc
   mon/MonCap.cc
@@ -503,7 +507,6 @@ set(libcommon_files
   common/dns_resolve.cc
   ${arch_files}
   ${auth_files}
-  $<TARGET_OBJECTS:compressor_objs>
   ${mds_files})
 if(LINUX)
   list(APPEND libcommon_files msg/async/EventEpoll.cc)
@@ -534,17 +537,36 @@ else()
     perfglue/disabled_stubs.cc)
 endif()
 
-if(ENABLE_SHARED)
-  list(APPEND libcommon_files
-    $<TARGET_OBJECTS:global_common_objs>)
-endif(ENABLE_SHARED)
-
-add_library(common STATIC ${libcommon_files}
-  $<TARGET_OBJECTS:mon_common_objs>
-  $<TARGET_OBJECTS:common_mountcephfs_objs>)
-target_link_libraries(common json_spirit erasure_code rt ${LIB_RESOLV}
-  ${Boost_LIBRARIES} ${BLKID_LIBRARIES} ${Backtrace_LIBRARIES}
+add_library(common-objs OBJECT ${libcommon_files})
+add_library(ceph-common SHARED
+  $<TARGET_OBJECTS:common_buffer_obj>
+  $<TARGET_OBJECTS:common_texttable_obj>
+  $<TARGET_OBJECTS:compressor_objs>
+  $<TARGET_OBJECTS:common-objs>
+  $<TARGET_OBJECTS:common_mountcephfs_objs>
+  $<TARGET_OBJECTS:global_common_objs>)
+target_link_libraries(ceph-common json_spirit erasure_code rt ${LIB_RESOLV}
+  ${Boost_THREAD_LIBRARY}
+  ${Boost_SYSTEM_LIBRARY}
+  ${Boost_REGEX_LIBRARY}
+  ${Boost_RANDOM_LIBRARY}
+  ${Boost_PROGRAM_OPTIONS_LIBRARY}
+  ${Boost_DATE_TIME_LIBRARY}
+  ${Boost_IOSTREAMS_LIBRARY}
+  ${BLKID_LIBRARIES} ${Backtrace_LIBRARIES}
   ${CRYPTO_LIBS} ${CMAKE_THREAD_LIBS_INIT} ${CMAKE_DL_LIBS})
+if(NOT WITH_SYSTEM_BOOST)
+  target_link_libraries(ceph-common ${ZLIB_LIBRARIES})
+endif()
+install(TARGETS ceph-common DESTINATION ${CMAKE_INSTALL_PKGLIBDIR})
+if(WITH_EMBEDDED)
+  add_library(cephd_common STATIC
+    $<TARGET_OBJECTS:common_buffer_obj>
+    $<TARGET_OBJECTS:common_texttable_obj>
+    $<TARGET_OBJECTS:compressor_objs>
+    $<TARGET_OBJECTS:common-objs>
+    $<TARGET_OBJECTS:common_mountcephfs_objs>)
+endif()
 
 set_source_files_properties(${CMAKE_SOURCE_DIR}/src/ceph_ver.c
   ${CMAKE_SOURCE_DIR}/src/common/version.cc
@@ -554,7 +576,7 @@ set_source_files_properties(${CMAKE_SOURCE_DIR}/src/ceph_ver.c
 include(SIMDExt)
 if(HAVE_ARMV8_CRC)
   add_library(common_crc_aarch64 STATIC common/crc32c_aarch64.c)
-  target_link_libraries(common common_crc_aarch64)
+  target_link_libraries(ceph-common common_crc_aarch64)
 endif(HAVE_ARMV8_CRC)
 
 add_library(common_utf8 STATIC common/utf8.c)
@@ -596,7 +618,7 @@ if (WITH_MGR)
                  $<TARGET_OBJECTS:heap_profiler_objs>)
   target_include_directories(ceph-mgr PRIVATE "${PYTHON_INCLUDE_DIRS}")
   target_link_libraries(ceph-mgr mds osdc global
-      -lboost_python ${PYTHON_LIBRARIES} ${BLKID_LIBRARIES} ${CMAKE_DL_LIBS} ${ALLOC_LIBS})
+      ${Boost_PYTHON_LIBRARY} ${PYTHON_LIBRARIES} ${BLKID_LIBRARIES} ${CMAKE_DL_LIBS} ${ALLOC_LIBS})
   install(TARGETS ceph-mgr DESTINATION bin)
 endif (WITH_MGR)
 
@@ -681,7 +703,7 @@ set(ceph_mon_srcs
 add_executable(ceph-mon ${ceph_mon_srcs}
   $<TARGET_OBJECTS:common_texttable_obj>)
 add_dependencies(ceph-mon erasure_code_plugins)
-      target_link_libraries(ceph-mon mon common os global ${EXTRALIBS}
+      target_link_libraries(ceph-mon mon ceph-common os global ${EXTRALIBS}
   ${CMAKE_DL_LIBS})
 install(TARGETS ceph-mon DESTINATION bin)
 
@@ -703,6 +725,10 @@ endif(WITH_CCACHE AND CCACHE_FOUND)
 
 list(APPEND ROCKSDB_CMAKE_ARGS -DCMAKE_AR=${CMAKE_AR})
 list(APPEND ROCKSDB_CMAKE_ARGS -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE})
+
+if (CMAKE_CXX_COMPILER_ID STREQUAL Clang)
+  list(APPEND ROCKSDB_CMAKE_ARGS -DFAIL_ON_WARNINGS=OFF)
+endif()
 
 # we use an external project and copy the sources to bin directory to ensure
 # that object files are built outside of the source tree.
@@ -827,8 +853,8 @@ add_subdirectory(bash_completion)
 if(WITH_LIBCEPHFS OR WITH_RBD)
   set(parse_secret_files
     common/secret.c)
+  add_library(parse_secret_objs OBJECT ${parse_secret_files})
 endif()
-add_library(parse_secret_objs OBJECT ${parse_secret_files})
 
 if(WITH_LIBCEPHFS)
   add_subdirectory(client)
@@ -837,7 +863,7 @@ if(WITH_LIBCEPHFS)
   target_link_libraries(cephfs LINK_PRIVATE client
     ${CRYPTO_LIBS} ${EXTRALIBS})
   if(ENABLE_SHARED)
-    foreach(name common client osdc)
+    foreach(name ceph-common client osdc)
       set(CEPHFS_LINK_FLAGS "${CEPHFS_LINK_FLAGS} -Wl,--exclude-libs,lib${name}.a")
     endforeach()
     set_target_properties(cephfs PROPERTIES
@@ -905,17 +931,25 @@ endif(WITH_KVS)
 if(WITH_RADOSGW)
   set(civetweb_common_files civetweb/src/civetweb.c)
   add_library(civetweb_common_objs OBJECT ${civetweb_common_files})
-  target_include_directories(civetweb_common_objs PUBLIC
+  target_include_directories(civetweb_common_objs PRIVATE
 	"${CMAKE_SOURCE_DIR}/src/civetweb/include")
   set_property(TARGET civetweb_common_objs
     APPEND PROPERTY COMPILE_DEFINITIONS USE_IPV6=1)
-  if(HAVE_SSL)
+  if(USE_OPENSSL)
     set_property(TARGET civetweb_common_objs
       APPEND PROPERTY COMPILE_DEFINITIONS NO_SSL_DL=1)
-    target_include_directories(civetweb_common_objs PUBLIC
+    target_include_directories(civetweb_common_objs PRIVATE
       "${SSL_INCLUDE_DIR}")
-  endif(HAVE_SSL)
+  endif(USE_OPENSSL)
+  if (LIBSSL_SONAME)
+    set_property(TARGET civetweb_common_objs
+      APPEND PROPERTY COMPILE_DEFINITIONS SSL_LIB="${LIBSSL_SONAME}")
+    set_property(TARGET civetweb_common_objs
+      APPEND PROPERTY COMPILE_DEFINITIONS CRYPTO_LIB="${LIBCRYPTO_SONAME}")
+  endif()
+
   add_subdirectory(rgw)
+
 endif(WITH_RADOSGW)
 
 install(FILES

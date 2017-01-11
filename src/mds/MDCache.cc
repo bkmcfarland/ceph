@@ -305,9 +305,7 @@ void MDCache::remove_inode(CInode *o)
   if (o->is_dirty_parent())
     o->clear_dirty_parent();
 
-  o->filelock.remove_dirty();
-  o->nestlock.remove_dirty();
-  o->dirfragtreelock.remove_dirty();
+  o->clear_scatter_dirty();
 
   o->item_open_file.remove_myself();
 
@@ -515,7 +513,7 @@ void MDCache::_create_system_file(CDir *dir, const char *name, CInode *in, MDSIn
   SnapRealm *realm = dir->get_inode()->find_snaprealm();
   dn->first = in->first = realm->get_newest_seq() + 1;
 
-  MutationRef mut(new MutationImpl);
+  auto mut(std::make_shared<MutationImpl>());
 
   // force some locks.  hacky.
   mds->locker->wrlock_force(&dir->inode->filelock, mut);
@@ -964,7 +962,7 @@ void MDCache::try_subtree_merge_at(CDir *dir, bool do_eval)
       inode_t *pi = in->project_inode();
       pi->version = in->pre_dirty();
       
-      MutationRef mut(new MutationImpl);
+      auto mut(std::make_shared<MutationImpl>());
       mut->ls = mds->mdlog->get_current_segment();
       EUpdate *le = new EUpdate(mds->mdlog, "subtree merge writebehind");
       mds->mdlog->start_entry(le);
@@ -3405,7 +3403,7 @@ void MDCache::handle_resolve_ack(MMDSResolveAck *ack)
       MDRequestRef mdr = request_get(*p);
       mdr->aborted = true;
       if (mdr->slave_request) {
-	if (mdr->more()->slave_commit) // journaling slave prepare ?
+	if (mdr->slave_did_prepare()) // journaling slave prepare ?
 	  add_rollback(*p, from);
       } else {
 	request_finish(mdr);
@@ -6073,7 +6071,7 @@ void MDCache::queue_file_recover(CInode *in)
     inode_t *pi = in->project_inode();
     pi->version = in->pre_dirty();
 
-    MutationRef mut(new MutationImpl);
+    auto mut(std::make_shared<MutationImpl>());
     mut->ls = mds->mdlog->get_current_segment();
     EUpdate *le = new EUpdate(mds->mdlog, "queue_file_recover cow");
     mds->mdlog->start_entry(le);
@@ -6257,9 +6255,8 @@ void MDCache::_truncate_inode(CInode *in, LogSegment *ls)
   filer.truncate(in->inode.ino, &in->inode.layout, *snapc,
 		 pi->truncate_size, pi->truncate_from-pi->truncate_size,
 		 pi->truncate_seq, ceph::real_time::min(), 0,
-		 0, new C_OnFinisher(new C_IO_MDC_TruncateFinish(this, in,
-								       ls),
-					   mds->finisher));
+		 new C_OnFinisher(new C_IO_MDC_TruncateFinish(this, in, ls),
+				  mds->finisher));
 }
 
 struct C_MDC_TruncateLogged : public MDCacheLogContext {
@@ -6286,7 +6283,7 @@ void MDCache::truncate_inode_finish(CInode *in, LogSegment *ls)
   pi->truncate_from = 0;
   pi->truncate_pending--;
 
-  MutationRef mut(new MutationImpl);
+  auto mut(std::make_shared<MutationImpl>());
   mut->ls = mds->mdlog->get_current_segment();
   mut->add_projected_inode(in);
 
@@ -8319,7 +8316,14 @@ void MDCache::_open_ino_backtrace_fetched(inodeno_t ino, bufferlist& bl, int err
 
   inode_backtrace_t backtrace;
   if (err == 0) {
-    ::decode(backtrace, bl);
+    try {
+      ::decode(backtrace, bl);
+    } catch (const buffer::error &decode_exc) {
+      derr << "corrupt backtrace on ino x0" << std::hex << ino
+           << std::dec << ": " << decode_exc << dendl;
+      open_ino_finish(ino, info, -EIO);
+      return;
+    }
     if (backtrace.pool != info.pool && backtrace.pool != -1) {
       dout(10) << " old object in pool " << info.pool
 	       << ", retrying pool " << backtrace.pool << dendl;
@@ -9021,10 +9025,6 @@ void MDCache::request_forward(MDRequestRef& mdr, mds_rank_t who, int port)
 
 void MDCache::dispatch_request(MDRequestRef& mdr)
 {
-  if (mdr->killed) {
-    dout(10) << "request " << *mdr << " was killed" << dendl;
-    return;
-  }
   if (mdr->client_request) {
     mds->server->dispatch_client_request(mdr);
   } else if (mdr->slave_request) {
@@ -9069,10 +9069,13 @@ void MDCache::request_drop_foreign_locks(MDRequestRef& mdr)
     MMDSSlaveRequest *r = new MMDSSlaveRequest(mdr->reqid, mdr->attempt,
 					       MMDSSlaveRequest::OP_FINISH);
 
-    // information about rename imported caps
-    if (mdr->more()->srcdn_auth_mds == *p &&
-	mdr->more()->inode_import.length() > 0)
+    if (mdr->killed && !mdr->committing) {
+      r->mark_abort();
+    } else if (mdr->more()->srcdn_auth_mds == *p &&
+	       mdr->more()->inode_import.length() > 0) {
+      // information about rename imported caps
       r->inode_export.claim(mdr->more()->inode_import);
+    }
 
     mds->send_message_mds(r, *p);
   }
@@ -9161,13 +9164,27 @@ void MDCache::request_cleanup(MDRequestRef& mdr)
 
 void MDCache::request_kill(MDRequestRef& mdr)
 {
+  // rollback slave requests is tricky. just let the request proceed.
+  if (mdr->done_locking && mdr->has_more() &&
+      (!mdr->more()->witnessed.empty() || !mdr->more()->waiting_on_slave.empty())) {
+    dout(10) << "request_kill " << *mdr << " -- already started slave requests, no-op" << dendl;
+
+    assert(mdr->used_prealloc_ino == 0);
+    assert(mdr->prealloc_inos.empty());
+
+    mdr->session = NULL;
+    mdr->item_session_request.remove_myself();
+    return;
+  }
+
   mdr->killed = true;
   mdr->mark_event("killing request");
-  if (!mdr->committing) {
+
+  if (mdr->committing) {
+    dout(10) << "request_kill " << *mdr << " -- already committing, no-op" << dendl;
+  } else {
     dout(10) << "request_kill " << *mdr << dendl;
     request_cleanup(mdr);
-  } else {
-    dout(10) << "request_kill " << *mdr << " -- already committing, no-op" << dendl;
   }
 }
 
@@ -9198,7 +9215,7 @@ void MDCache::snaprealm_create(MDRequestRef& mdr, CInode *in)
     return;
   }
 
-  MutationRef mut(new MutationImpl);
+  auto mut(std::make_shared<MutationImpl>());
   mut->ls = mds->mdlog->get_current_segment();
   EUpdate *le = new EUpdate(mds->mdlog, "snaprealm_create");
   mds->mdlog->start_entry(le);
@@ -11324,7 +11341,7 @@ void MDCache::_fragment_committed(dirfrag_t basedirfrag, list<CDir*>& resultfrag
     }
     mds->objecter->mutate(oid, oloc, op, nullsnapc,
 			  ceph::real_clock::now(),
-			  0, NULL, gather.new_sub());
+			  0, gather.new_sub());
   }
 
   assert(gather.has_subs());

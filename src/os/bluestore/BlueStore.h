@@ -215,7 +215,7 @@ public:
 	boost::intrusive::list_member_hook<>,
 	&Buffer::state_item> > state_list_t;
 
-    mempool::bluestore_meta_other::map<uint64_t, std::unique_ptr<Buffer>>
+    mempool::bluestore_meta_other::map<uint32_t, std::unique_ptr<Buffer>>
       buffer_map;
     Cache *cache;
 
@@ -250,7 +250,7 @@ public:
     void _rm_buffer(Buffer *b) {
       _rm_buffer(buffer_map.find(b->offset));
     }
-    void _rm_buffer(map<uint64_t,std::unique_ptr<Buffer>>::iterator p) {
+    void _rm_buffer(map<uint32_t,std::unique_ptr<Buffer>>::iterator p) {
       assert(p != buffer_map.end());
       cache->_audit("_rm_buffer start");
       if (p->second->is_writing()) {
@@ -262,7 +262,7 @@ public:
       cache->_audit("_rm_buffer end");
     }
 
-    map<uint64_t,std::unique_ptr<Buffer>>::iterator _data_lower_bound(
+    map<uint32_t,std::unique_ptr<Buffer>>::iterator _data_lower_bound(
       uint64_t offset) {
       auto i = buffer_map.lower_bound(offset);
       if (i != buffer_map.begin()) {
@@ -271,10 +271,6 @@ public:
 	  ++i;
       }
       return i;
-    }
-
-    bool empty() const {
-      return buffer_map.empty();
     }
 
     // must be called under protection of the Cache lock
@@ -775,14 +771,6 @@ public:
 
     /// split a blob (and referring extents)
     BlobRef split_blob(BlobRef lb, uint32_t blob_offset, uint32_t pos);
-
-    bool do_write_check_depth(
-      uint64_t onode_size,
-      uint64_t start_offset,
-      uint64_t end_offset,
-      uint8_t  *blob_depth,
-      uint64_t *gc_start_offset,
-      uint64_t *gc_end_offset);
   };
 
   struct OnodeSpace;
@@ -804,6 +792,7 @@ public:
 
     ExtentMap extent_map;
 
+    std::atomic<int> flushing_count = {0};
     std::mutex flush_lock;  ///< protect flush_txns
     std::condition_variable flush_cond;   ///< wait here for unapplied txns
     set<TransContext*> flush_txns;   ///< committing or wal txns
@@ -842,7 +831,7 @@ public:
 
     static Cache *create(CephContext* cct, string type, PerfCounters *logger);
 
-    Cache(CephContext* cct) : cct(cct) {}
+    Cache(CephContext* cct) : cct(cct), logger(nullptr) {}
     virtual ~Cache() {}
 
     virtual void _add_onode(OnodeRef& o, int level) = 0;
