@@ -12,7 +12,7 @@ explore Ceph functionality.
 As a first exercise, create a Ceph Storage Cluster with one Ceph Monitor and two
 Ceph OSD Daemons. Once the cluster reaches a ``active + clean`` state, expand it
 by adding a third Ceph OSD Daemon, a Metadata Server and two more Ceph Monitors.
-For best results, create a directory on your admin node node for maintaining the
+For best results, create a directory on your admin node for maintaining the
 configuration files and keys that ``ceph-deploy`` generates for your cluster. ::
 
 	mkdir my-cluster
@@ -38,14 +38,11 @@ Create a Cluster
 ================
 
 If at any point you run into trouble and you want to start over, execute
-the following to purge the configuration::
-
-	ceph-deploy purgedata {ceph-node} [{ceph-node}]
-	ceph-deploy forgetkeys
-
-To purge the Ceph packages too, you may also execute::
+the following to purge the Ceph packages, and erase all its data and configuration::
 
 	ceph-deploy purge {ceph-node} [{ceph-node}]
+	ceph-deploy purgedata {ceph-node} [{ceph-node}]
+	ceph-deploy forgetkeys
 
 If you execute ``purge``, you must re-install Ceph.
 
@@ -56,7 +53,7 @@ configuration details, perform the following steps using ``ceph-deploy``.
 
 	ceph-deploy new {initial-monitor-node(s)}
 
-   For example::
+   Specify node(s) as hostname, fqdn or hostname:fqdn. For example::
 
 	ceph-deploy new node1
 

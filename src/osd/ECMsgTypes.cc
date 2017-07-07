@@ -169,8 +169,8 @@ void ECSubRead::encode(bufferlist &bl, uint64_t features) const
     ENCODE_START(1, 1, bl);
     ::encode(from, bl);
     ::encode(tid, bl);
-    map<hobject_t, list<pair<uint64_t, uint64_t> >, hobject_t::BitwiseComparator> tmp;
-    for (map<hobject_t, list<boost::tuple<uint64_t, uint64_t, uint32_t> >, hobject_t::BitwiseComparator>::const_iterator m = to_read.begin();
+    map<hobject_t, list<pair<uint64_t, uint64_t> >> tmp;
+    for (map<hobject_t, list<boost::tuple<uint64_t, uint64_t, uint32_t> >>::const_iterator m = to_read.begin();
 	  m != to_read.end(); ++m) {
       list<pair<uint64_t, uint64_t> > tlist;
       for (list<boost::tuple<uint64_t, uint64_t, uint32_t> >::const_iterator l = m->second.begin();
@@ -199,9 +199,9 @@ void ECSubRead::decode(bufferlist::iterator &bl)
   ::decode(from, bl);
   ::decode(tid, bl);
   if (struct_v == 1) {
-    map<hobject_t, list<pair<uint64_t, uint64_t> >, hobject_t::BitwiseComparator>tmp;
+    map<hobject_t, list<pair<uint64_t, uint64_t> >>tmp;
     ::decode(tmp, bl);
-    for (map<hobject_t, list<pair<uint64_t, uint64_t> >, hobject_t::BitwiseComparator>::const_iterator m = tmp.begin();
+    for (map<hobject_t, list<pair<uint64_t, uint64_t> >>::const_iterator m = tmp.begin();
 	  m != tmp.end(); ++m) {
       list<boost::tuple<uint64_t, uint64_t, uint32_t> > tlist;
       for (list<pair<uint64_t, uint64_t> > ::const_iterator l = m->second.begin();
@@ -231,7 +231,7 @@ void ECSubRead::dump(Formatter *f) const
   f->dump_stream("from") << from;
   f->dump_unsigned("tid", tid);
   f->open_array_section("objects");
-  for (map<hobject_t, list<boost::tuple<uint64_t, uint64_t, uint32_t> >, hobject_t::BitwiseComparator>::const_iterator i =
+  for (map<hobject_t, list<boost::tuple<uint64_t, uint64_t, uint32_t> >>::const_iterator i =
 	 to_read.begin();
        i != to_read.end();
        ++i) {
@@ -254,7 +254,7 @@ void ECSubRead::dump(Formatter *f) const
   f->close_section();
 
   f->open_array_section("object_attrs_requested");
-  for (set<hobject_t,hobject_t::BitwiseComparator>::const_iterator i = attrs_to_read.begin();
+  for (set<hobject_t>::const_iterator i = attrs_to_read.begin();
        i != attrs_to_read.end();
        ++i) {
     f->open_object_section("object");
@@ -269,14 +269,14 @@ void ECSubRead::generate_test_instances(list<ECSubRead*>& o)
   hobject_t hoid1(sobject_t("asdf", 1));
   hobject_t hoid2(sobject_t("asdf2", CEPH_NOSNAP));
   o.push_back(new ECSubRead());
-  o.back()->from = pg_shard_t(2, shard_id_t(255));
+  o.back()->from = pg_shard_t(2, shard_id_t(-1));
   o.back()->tid = 1;
   o.back()->to_read[hoid1].push_back(boost::make_tuple(100, 200, 0));
   o.back()->to_read[hoid1].push_back(boost::make_tuple(400, 600, 0));
   o.back()->to_read[hoid2].push_back(boost::make_tuple(400, 600, 0));
   o.back()->attrs_to_read.insert(hoid1);
   o.push_back(new ECSubRead());
-  o.back()->from = pg_shard_t(2, shard_id_t(255));
+  o.back()->from = pg_shard_t(2, shard_id_t(-1));
   o.back()->tid = 300;
   o.back()->to_read[hoid1].push_back(boost::make_tuple(300, 200, 0));
   o.back()->to_read[hoid2].push_back(boost::make_tuple(400, 600, 0));
@@ -320,7 +320,7 @@ void ECSubReadReply::dump(Formatter *f) const
   f->dump_stream("from") << from;
   f->dump_unsigned("tid", tid);
   f->open_array_section("buffers_read");
-  for (map<hobject_t, list<pair<uint64_t, bufferlist> >, hobject_t::BitwiseComparator>::const_iterator i =
+  for (map<hobject_t, list<pair<uint64_t, bufferlist> >>::const_iterator i =
 	 buffers_read.begin();
        i != buffers_read.end();
        ++i) {
@@ -342,7 +342,7 @@ void ECSubReadReply::dump(Formatter *f) const
   f->close_section();
 
   f->open_array_section("attrs_returned");
-  for (map<hobject_t, map<string, bufferlist>, hobject_t::BitwiseComparator>::const_iterator i =
+  for (map<hobject_t, map<string, bufferlist>>::const_iterator i =
 	 attrs_read.begin();
        i != attrs_read.end();
        ++i) {
@@ -363,7 +363,7 @@ void ECSubReadReply::dump(Formatter *f) const
   f->close_section();
 
   f->open_array_section("errors");
-  for (map<hobject_t, int, hobject_t::BitwiseComparator>::const_iterator i = errors.begin();
+  for (map<hobject_t, int>::const_iterator i = errors.begin();
        i != errors.end();
        ++i) {
     f->open_object_section("error_pair");
@@ -383,7 +383,7 @@ void ECSubReadReply::generate_test_instances(list<ECSubReadReply*>& o)
   bufferlist bl2;
   bl2.append_zero(200);
   o.push_back(new ECSubReadReply());
-  o.back()->from = pg_shard_t(2, shard_id_t(255));
+  o.back()->from = pg_shard_t(2, shard_id_t(-1));
   o.back()->tid = 1;
   o.back()->buffers_read[hoid1].push_back(make_pair(20, bl));
   o.back()->buffers_read[hoid1].push_back(make_pair(2000, bl2));
@@ -391,7 +391,7 @@ void ECSubReadReply::generate_test_instances(list<ECSubReadReply*>& o)
   o.back()->attrs_read[hoid1]["foo"] = bl;
   o.back()->attrs_read[hoid1]["_"] = bl2;
   o.push_back(new ECSubReadReply());
-  o.back()->from = pg_shard_t(2, shard_id_t(255));
+  o.back()->from = pg_shard_t(2, shard_id_t(-1));
   o.back()->tid = 300;
   o.back()->buffers_read[hoid2].push_back(make_pair(0, bl2));
   o.back()->attrs_read[hoid2]["foo"] = bl;

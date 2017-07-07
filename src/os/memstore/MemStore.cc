@@ -120,7 +120,7 @@ void MemStore::dump(Formatter *f)
     f->close_section();
 
     f->open_array_section("objects");
-    for (map<ghobject_t,ObjectRef,ghobject_t::BitwiseComparator>::iterator q = p->second->object_map.begin();
+    for (map<ghobject_t,ObjectRef>::iterator q = p->second->object_map.begin();
 	 q != p->second->object_map.end();
 	 ++q) {
       f->open_object_section("object");
@@ -316,13 +316,12 @@ int MemStore::read(
     uint64_t offset,
     size_t len,
     bufferlist& bl,
-    uint32_t op_flags,
-    bool allow_eio)
+    uint32_t op_flags)
 {
   CollectionHandle c = get_collection(cid);
   if (!c)
     return -ENOENT;
-  return read(c, oid, offset, len, bl, op_flags, allow_eio);
+  return read(c, oid, offset, len, bl, op_flags);
 }
 
 int MemStore::read(
@@ -331,8 +330,7 @@ int MemStore::read(
   uint64_t offset,
   size_t len,
   bufferlist& bl,
-  uint32_t op_flags,
-  bool allow_eio)
+  uint32_t op_flags)
 {
   Collection *c = static_cast<Collection*>(c_.get());
   dout(10) << __func__ << " " << c->cid << " " << oid << " "
@@ -356,6 +354,16 @@ int MemStore::read(
 int MemStore::fiemap(const coll_t& cid, const ghobject_t& oid,
 		     uint64_t offset, size_t len, bufferlist& bl)
 {
+  map<uint64_t, uint64_t> destmap;
+  int r = fiemap(cid, oid, offset, len, destmap);
+  if (r >= 0)
+    ::encode(destmap, bl);
+  return r;
+}
+
+int MemStore::fiemap(const coll_t& cid, const ghobject_t& oid,
+		     uint64_t offset, size_t len, map<uint64_t, uint64_t>& destmap)
+{
   dout(10) << __func__ << " " << cid << " " << oid << " " << offset << "~"
 	   << len << dendl;
   CollectionRef c = get_collection(cid);
@@ -365,15 +373,13 @@ int MemStore::fiemap(const coll_t& cid, const ghobject_t& oid,
   ObjectRef o = c->get_object(oid);
   if (!o)
     return -ENOENT;
-  map<uint64_t, uint64_t> m;
   size_t l = len;
   if (offset + l > o->get_size())
     l = o->get_size() - offset;
   if (offset >= o->get_size())
     goto out;
-  m[offset] = l;
+  destmap[offset] = l;
  out:
-  ::encode(m, bl);
   return 0;
 }
 
@@ -460,14 +466,22 @@ int MemStore::collection_empty(const coll_t& cid, bool *empty)
   return 0;
 }
 
+int MemStore::collection_bits(const coll_t& cid)
+{
+  dout(10) << __func__ << " " << cid << dendl;
+  CollectionRef c = get_collection(cid);
+  if (!c)
+    return -ENOENT;
+  RWLock::RLocker l(c->lock);
+  return c->bits;
+}
+
 int MemStore::collection_list(const coll_t& cid,
 			      const ghobject_t& start,
 			      const ghobject_t& end,
-			      bool sort_bitwise, int max,
+			      int max,
 			      vector<ghobject_t> *ls, ghobject_t *next)
 {
-  if (!sort_bitwise)
-    return -EOPNOTSUPP;
   CollectionRef c = get_collection(cid);
   if (!c)
     return -ENOENT;
@@ -475,10 +489,10 @@ int MemStore::collection_list(const coll_t& cid,
 
   dout(10) << __func__ << " cid " << cid << " start " << start
 	   << " end " << end << dendl;
-  map<ghobject_t,ObjectRef,ghobject_t::BitwiseComparator>::iterator p = c->object_map.lower_bound(start);
+  map<ghobject_t,ObjectRef>::iterator p = c->object_map.lower_bound(start);
   while (p != c->object_map.end() &&
 	 ls->size() < (unsigned)max &&
-	 cmp_bitwise(p->first, end) < 0) {
+	 p->first < end) {
     ls->push_back(p->first);
     ++p;
   }
@@ -615,39 +629,39 @@ public:
   OmapIteratorImpl(CollectionRef c, ObjectRef o)
     : c(c), o(o), it(o->omap.begin()) {}
 
-  int seek_to_first() {
+  int seek_to_first() override {
     std::lock_guard<std::mutex>(o->omap_mutex);
     it = o->omap.begin();
     return 0;
   }
-  int upper_bound(const string &after) {
+  int upper_bound(const string &after) override {
     std::lock_guard<std::mutex>(o->omap_mutex);
     it = o->omap.upper_bound(after);
     return 0;
   }
-  int lower_bound(const string &to) {
+  int lower_bound(const string &to) override {
     std::lock_guard<std::mutex>(o->omap_mutex);
     it = o->omap.lower_bound(to);
     return 0;
   }
-  bool valid() {
+  bool valid() override {
     std::lock_guard<std::mutex>(o->omap_mutex);
     return it != o->omap.end();
   }
-  int next(bool validate=true) {
+  int next(bool validate=true) override {
     std::lock_guard<std::mutex>(o->omap_mutex);
     ++it;
     return 0;
   }
-  string key() {
+  string key() override {
     std::lock_guard<std::mutex>(o->omap_mutex);
     return it->first;
   }
-  bufferlist value() {
+  bufferlist value() override {
     std::lock_guard<std::mutex>(o->omap_mutex);
     return it->second;
   }
-  int status() {
+  int status() override {
     return 0;
   }
 };
@@ -856,7 +870,7 @@ void MemStore::_do_transaction(Transaction& t)
     case Transaction::OP_MKCOLL:
       {
         coll_t cid = i.get_cid(op->cid);
-	r = _create_collection(cid);
+	r = _create_collection(cid, op->split_bits);
       }
       break;
 
@@ -1040,7 +1054,7 @@ void MemStore::_do_transaction(Transaction& t)
 	if (r == -ENOSPC)
 	  // For now, if we hit _any_ ENOSPC, crash, before we do any damage
 	  // by partially applying transactions.
-	  msg = "ENOSPC handling not implemented";
+	  msg = "ENOSPC from MemStore, misconfigured cluster or insufficient memory";
 
 	if (r == -ENOTEMPTY) {
 	  msg = "ENOTEMPTY suggests garbage data in osd data dir";
@@ -1347,7 +1361,7 @@ int MemStore::_omap_setheader(const coll_t& cid, const ghobject_t &oid,
   return 0;
 }
 
-int MemStore::_create_collection(const coll_t& cid)
+int MemStore::_create_collection(const coll_t& cid, int bits)
 {
   dout(10) << __func__ << " " << cid << dendl;
   RWLock::WLocker l(coll_lock);
@@ -1355,6 +1369,7 @@ int MemStore::_create_collection(const coll_t& cid)
   if (!result.second)
     return -EEXIST;
   result.first->second.reset(new Collection(cct, cid));
+  result.first->second->bits = bits;
   return 0;
 }
 
@@ -1447,7 +1462,7 @@ int MemStore::_split_collection(const coll_t& cid, uint32_t bits, uint32_t match
   RWLock::WLocker l1(MIN(&(*sc), &(*dc))->lock);
   RWLock::WLocker l2(MAX(&(*sc), &(*dc))->lock);
 
-  map<ghobject_t,ObjectRef,ghobject_t::BitwiseComparator>::iterator p = sc->object_map.begin();
+  map<ghobject_t,ObjectRef>::iterator p = sc->object_map.begin();
   while (p != sc->object_map.end()) {
     if (p->first.match(bits, match)) {
       dout(20) << " moving " << p->first << dendl;
@@ -1459,6 +1474,9 @@ int MemStore::_split_collection(const coll_t& cid, uint32_t bits, uint32_t match
       ++p;
     }
   }
+
+  sc->bits = bits;
+  assert(dc->bits == (int)bits);
 
   return 0;
 }

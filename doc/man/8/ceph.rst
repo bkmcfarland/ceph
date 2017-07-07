@@ -13,7 +13,7 @@ Synopsis
 
 | **ceph** **compact**
 
-| **ceph** **config-key** [ *del* | *exists* | *get* | *list* | *put* ] ...
+| **ceph** **config-key** [ *del* | *exists* | *get* | *list* | *dump* | *put* ] ...
 
 | **ceph** **daemon** *<name>* \| *<path>* *<command>* ...
 
@@ -39,7 +39,7 @@ Synopsis
 
 | **ceph** **mon_status**
 
-| **ceph** **osd** [ *blacklist* \| *blocked-by* \| *create* \| *deep-scrub* \| *df* \| *down* \| *dump* \| *erasure-code-profile* \| *find* \| *getcrushmap* \| *getmap* \| *getmaxosd* \| *in* \| *lspools* \| *map* \| *metadata* \| *out* \| *pause* \| *perf* \| *pg-temp* \| *primary-affinity* \| *primary-temp* \| *repair* \| *reweight* \| *reweight-by-pg* \| *rm* \| *scrub* \| *set* \| *setcrushmap* \| *setmaxosd*  \| *stat* \| *thrash* \| *tree* \| *unpause* \| *unset* ] ...
+| **ceph** **osd** [ *blacklist* \| *blocked-by* \| *create* \| *new* \| *deep-scrub* \| *df* \| *down* \| *dump* \| *erasure-code-profile* \| *find* \| *getcrushmap* \| *getmap* \| *getmaxosd* \| *in* \| *lspools* \| *map* \| *metadata* \| *out* \| *pause* \| *perf* \| *pg-temp* \| *primary-affinity* \| *primary-temp* \| *repair* \| *reweight* \| *reweight-by-pg* \| *rm* \| *destroy* \| *purge* \| *scrub* \| *set* \| *setcrushmap* \| *setmaxosd*  \| *stat* \| *tree* \| *unpause* \| *unset* ] ...
 
 | **ceph** **osd** **crush** [ *add* \| *add-bucket* \| *create-or-move* \| *dump* \| *get-tunable* \| *link* \| *move* \| *remove* \| *rename-bucket* \| *reweight* \| *reweight-all* \| *reweight-subtree* \| *rm* \| *rule* \| *set* \| *set-tunable* \| *show-tunables* \| *tunables* \| *unlink* ] ...
 
@@ -201,7 +201,13 @@ Usage::
 
 	ceph config-key list
 
-Subcommand ``put`` puts configuration key and values.
+Subcommand ``dump`` dumps configuration keys and values.
+
+Usage::
+
+	ceph config-key dump
+
+Subcommand ``put`` puts configuration key and value.
 
 Usage::
 
@@ -472,9 +478,39 @@ Usage::
 
 Subcommand ``create`` creates new osd (with optional UUID and ID).
 
+This command is DEPRECATED as of the Luminous release, and will be removed in
+a future release.
+
+Subcommand ``new`` should instead be used.
+
 Usage::
 
 	ceph osd create {<uuid>} {<id>}
+
+Subcommand ``new`` reuses a previously destroyed OSD *id*. The new OSD will
+have the specified *uuid*, and the command expects a JSON file containing
+the base64 cephx key for auth entity *client.osd.<id>*, as well as optional
+base64 cepx key for dm-crypt lockbox access and a dm-crypt key. Specifying
+a dm-crypt requires specifying the accompanying lockbox cephx key.
+
+Usage::
+
+    ceph osd new {<id>} {<uuid>} -i {<secrets.json>}
+
+The secrets JSON file is expected to maintain a form of the following format::
+
+    {
+        "cephx_secret": "AQBWtwhZdBO5ExAAIDyjK2Bh16ZXylmzgYYEjg=="
+    }
+
+Or::
+
+    {
+        "cephx_secret": "AQBWtwhZdBO5ExAAIDyjK2Bh16ZXylmzgYYEjg==",
+        "cephx_lockbox_secret": "AQDNCglZuaeVCRAAYr76PzR1Anh7A0jswkODIQ==",
+        "dmcrypt_key": "<dm-crypt key>"
+    }
+        
 
 Subcommand ``crush`` is used for CRUSH management. It uses some additional
 subcommands.
@@ -932,6 +968,29 @@ Usage::
 
 	ceph osd rm <ids> [<ids>...]
 
+Subcommand ``destroy`` marks OSD *id* as *destroyed*, removing its cephx
+entity's keys and all of its dm-crypt and daemon-private config key
+entries.
+
+This command will not remove the OSD from crush, nor will it remove the
+OSD from the OSD map. Instead, once the command successfully completes,
+the OSD will show marked as *destroyed*.
+
+In order to mark an OSD as destroyed, the OSD must first be marked as
+**lost**.
+
+Usage::
+
+    ceph osd destroy <id> {--yes-i-really-mean-it}
+
+
+Subcommand ``purge`` performs a combination of ``osd destroy``,
+``osd rm`` and ``osd crush remove``.
+
+Usage::
+
+    ceph osd purge <id> {--yes-i-really-mean-it}
+
 Subcommand ``scrub`` initiates scrub on specified osd.
 
 Usage::
@@ -1112,7 +1171,7 @@ Usage::
 	deep_scrub|backfill|backfill_toofull|recovery_wait|
 	undersized...]}
 
-Subcommand ``ls-by-pool`` lists pg with pool = [poolname | poolid]
+Subcommand ``ls-by-pool`` lists pg with pool = [poolname]
 
 Usage::
 
@@ -1165,6 +1224,12 @@ Subcommand ``set_full_ratio`` sets ratio at which pgs are considered full.
 Usage::
 
 	ceph pg set_full_ratio <float[0.0-1.0]>
+
+Subcommand ``set_backfillfull_ratio`` sets ratio at which pgs are considered too full to backfill.
+
+Usage::
+
+	ceph pg set_backfillfull_ratio <float[0.0-1.0]>
 
 Subcommand ``set_nearfull_ratio`` sets ratio at which pgs are considered nearly
 full.
@@ -1252,6 +1317,13 @@ Sends a command to a specific daemon.
 Usage::
 
 	ceph tell <name (type.id)> <args> [<args>...]
+
+
+List all available commands.
+
+Usage::
+
+ 	ceph tell <name (type.id)> help
 
 version
 -------

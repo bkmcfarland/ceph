@@ -25,6 +25,10 @@
 #include "common/Timer.h"
 #include "common/errno.h"
 
+#include "messages/MOSDOp.h"
+#include "messages/MOSDOpReply.h"
+#include "common/EventTrace.h"
+
 #define dout_subsys ceph_subsys_ms
 #undef dout_prefix
 #define dout_prefix _prefix(_dout, this)
@@ -46,7 +50,7 @@ class Processor::C_processor_accept : public EventCallback {
 
  public:
   explicit C_processor_accept(Processor *p): pro(p) {}
-  void do_request(int id) {
+  void do_request(int id) override {
     pro->accept();
   }
 };
@@ -161,12 +165,16 @@ void Processor::accept()
   opts.nodelay = msgr->cct->_conf->ms_tcp_nodelay;
   opts.rcbuf_size = msgr->cct->_conf->ms_tcp_rcvbuf;
   opts.priority = msgr->get_socket_priority();
+  Worker *w;
   while (true) {
     entity_addr_t addr;
     ConnectedSocket cli_socket;
-    Worker *w = worker;
-    if (!msgr->get_stack()->support_local_listen_table())
+    if (msgr->get_stack()->support_local_listen_table()) {
+      w = worker;
+      w->references++;
+    } else {
       w = msgr->get_stack()->get_worker();
+    }
     int r = listen_socket.accept(&cli_socket, opts, &addr, w);
     if (r == 0) {
       ldout(msgr->cct, 10) << __func__ << " accepted incoming on sd " << cli_socket.fd() << dendl;
@@ -174,6 +182,7 @@ void Processor::accept()
       msgr->add_accept(w, std::move(cli_socket), addr);
       continue;
     } else {
+      w->release_worker();
       if (r == -EINTR) {
         continue;
       } else if (r == -EAGAIN) {
@@ -209,9 +218,13 @@ void Processor::stop()
 
 
 struct StackSingleton {
+  CephContext *cct;
   std::shared_ptr<NetworkStack> stack;
-  StackSingleton(CephContext *c) {
-    stack = NetworkStack::create(c, c->_conf->ms_async_transport_type);
+
+  StackSingleton(CephContext *c): cct(c) {}
+  void ready(std::string &type) {
+    if (!stack)
+      stack = NetworkStack::create(cct, type);
   }
   ~StackSingleton() {
     stack->stop();
@@ -224,7 +237,7 @@ class C_handle_reap : public EventCallback {
 
   public:
   explicit C_handle_reap(AsyncMessenger *m): msgr(m) {}
-  void do_request(int id) {
+  void do_request(int id) override {
     // judge whether is a time event
     msgr->reap_dead();
   }
@@ -235,7 +248,7 @@ class C_handle_reap : public EventCallback {
  */
 
 AsyncMessenger::AsyncMessenger(CephContext *cct, entity_name_t name,
-                               string mname, uint64_t _nonce)
+                               const std::string &type, string mname, uint64_t _nonce)
   : SimplePolicyMessenger(cct, name,mname, _nonce),
     dispatch_queue(cct, this, mname),
     lock("AsyncMessenger::lock"),
@@ -243,9 +256,16 @@ AsyncMessenger::AsyncMessenger(CephContext *cct, entity_name_t name,
     global_seq(0), deleted_lock("AsyncMessenger::deleted_lock"),
     cluster_protocol(0), stopped(true)
 {
+  std::string transport_type = "posix";
+  if (type.find("rdma") != std::string::npos)
+    transport_type = "rdma";
+  else if (type.find("dpdk") != std::string::npos)
+    transport_type = "dpdk";
+
   ceph_spin_init(&global_seq_lock);
   StackSingleton *single;
-  cct->lookup_or_create_singleton_object<StackSingleton>(single, "AsyncMessenger::NetworkStack");
+  cct->lookup_or_create_singleton_object<StackSingleton>(single, "AsyncMessenger::NetworkStack::"+transport_type);
+  single->ready(transport_type);
   stack = single->stack.get();
   stack->start();
   local_worker = stack->get_worker();
@@ -276,7 +296,15 @@ void AsyncMessenger::ready()
 {
   ldout(cct,10) << __func__ << " " << get_myaddr() << dendl;
 
-  stack->start();
+  stack->ready();
+  if (pending_bind) {
+    int err = bind(pending_bind_addr);
+    if (err) {
+      lderr(cct) << __func__ << " postponed bind failed" << dendl;
+      ceph_abort();
+    }
+  }
+
   Mutex::Locker l(lock);
   for (auto &&p : processors)
     p->start();
@@ -306,12 +334,23 @@ int AsyncMessenger::shutdown()
 int AsyncMessenger::bind(const entity_addr_t &bind_addr)
 {
   lock.Lock();
-  if (started) {
+
+  if (!pending_bind && started) {
     ldout(cct,10) << __func__ << " already started" << dendl;
     lock.Unlock();
     return -1;
   }
+
   ldout(cct,10) << __func__ << " bind " << bind_addr << dendl;
+
+  if (!stack->is_ready()) {
+    ldout(cct, 10) << __func__ << " Network Stack is not ready for bind yet - postponed" << dendl;
+    pending_bind_addr = bind_addr;
+    pending_bind = true;
+    lock.Unlock();
+    return 0;
+  }
+
   lock.Unlock();
 
   // bind to a socket
@@ -373,6 +412,25 @@ int AsyncMessenger::rebind(const set<int>& avoid_ports)
   for (auto &&p : processors) {
     p->start();
   }
+  return 0;
+}
+
+int AsyncMessenger::client_bind(const entity_addr_t &bind_addr)
+{
+  if (!cct->_conf->ms_bind_before_connect)
+    return 0;
+  Mutex::Locker l(lock);
+  if (did_bind) {
+    assert(my_inst.addr == bind_addr);
+    return 0;
+  }
+  if (started) {
+    ldout(cct, 10) << __func__ << " already started" << dendl;
+    return -1;
+  }
+  ldout(cct, 10) << __func__ << " " << bind_addr << dendl;
+
+  set_myaddr(bind_addr);
   return 0;
 }
 
@@ -500,6 +558,14 @@ ConnectionRef AsyncMessenger::get_loopback_connection()
 
 int AsyncMessenger::_send_message(Message *m, const entity_inst_t& dest)
 {
+  FUNCTRACE();
+  assert(m);
+
+  if (m->get_type() == CEPH_MSG_OSD_OP)
+    OID_EVENT_TRACE(((MOSDOp *)m)->get_oid().name.c_str(), "SEND_MSG_OSD_OP");
+  else if (m->get_type() == CEPH_MSG_OSD_OPREPLY)
+    OID_EVENT_TRACE(((MOSDOpReply *)m)->get_oid().name.c_str(), "SEND_MSG_OSD_OP_REPLY");
+
   ldout(cct, 1) << __func__ << "--> " << dest.name << " "
       << dest.addr << " -- " << *m << " -- ?+"
       << m->get_data().length() << " " << m << dendl;
@@ -571,12 +637,6 @@ void AsyncMessenger::set_addr_unknowns(const entity_addr_t &addr)
     my_inst.addr.set_port(port);
     _init_local_connection();
   }
-}
-
-int AsyncMessenger::send_keepalive(Connection *con)
-{
-  con->send_keepalive();
-  return 0;
 }
 
 void AsyncMessenger::shutdown_connections(bool queue_reset)

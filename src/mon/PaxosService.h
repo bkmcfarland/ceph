@@ -53,7 +53,9 @@ class PaxosService {
    */
   bool proposing;
 
- protected:
+  bool need_immediate_propose = false;
+
+protected:
   /**
    * Services implementing us used to depend on the Paxos version, back when
    * each service would have a Paxos instance for itself. However, now we only
@@ -104,7 +106,7 @@ protected:
   public:
     C_RetryMessage(PaxosService *s, MonOpRequestRef op_) :
       C_MonOp(op_), svc(s) { }
-    void _finish(int r) {
+    void _finish(int r) override {
       if (r == -EAGAIN || r >= 0)
 	svc->dispatch(op);
       else if (r == -ECANCELED)
@@ -117,8 +119,6 @@ protected:
   /**
    * @}
    */
-  friend class C_Propose;
-  
 
 public:
   /**
@@ -189,7 +189,7 @@ private:
    * @remarks We only create a pending state we our Monitor is the Leader.
    *
    * @pre Paxos is active
-   * @post have_pending is true iif our Monitor is the Leader and Paxos is
+   * @post have_pending is true if our Monitor is the Leader and Paxos is
    *	   active
    */
   void _active();
@@ -359,6 +359,15 @@ public:
   virtual bool should_propose(double &delay);
 
   /**
+   * force an immediate propose.
+   *
+   * This is meant to be called from prepare_update(op).
+   */
+  void force_immediate_propose() {
+    need_immediate_propose = true;
+  }
+
+  /**
    * @defgroup PaxosService_h_courtesy Courtesy functions
    *
    * Courtesy functions, in case the class implementing this service has
@@ -515,10 +524,7 @@ public:
    * @returns true if writeable; false otherwise
    */
   bool is_writeable() {
-    return
-      !is_proposing() &&
-      is_write_ready() &&
-      (paxos->is_active() || paxos->is_updating() || paxos->is_writing());
+    return is_write_ready(); 
   }
 
   /**
@@ -541,7 +547,7 @@ public:
    */
   void wait_for_finished_proposal(MonOpRequestRef op, Context *c) {
     if (op)
-      op->mark_event(service_name + ":wait_for_finished_proposal");
+      op->mark_event_string(service_name + ":wait_for_finished_proposal");
     waiting_for_finished_proposal.push_back(c);
   }
   void wait_for_finished_proposal_ctx(Context *c) {
@@ -556,7 +562,7 @@ public:
    */
   void wait_for_active(MonOpRequestRef op, Context *c) {
     if (op)
-      op->mark_event(service_name + ":wait_for_active");
+      op->mark_event_string(service_name + ":wait_for_active");
 
     if (!is_proposing()) {
       paxos->wait_for_active(op, c);
@@ -583,7 +589,7 @@ public:
      * happens to be readable at that specific point in time.
      */
     if (op)
-      op->mark_event(service_name + ":wait_for_readable");
+      op->mark_event_string(service_name + ":wait_for_readable");
 
     if (is_proposing() ||
 	ver > get_last_committed() ||
@@ -591,7 +597,7 @@ public:
       wait_for_finished_proposal(op, c);
     else {
       if (op)
-        op->mark_event(service_name + ":wait_for_readable/paxos");
+        op->mark_event_string(service_name + ":wait_for_readable/paxos");
 
       paxos->wait_for_readable(op, c);
     }
@@ -609,7 +615,7 @@ public:
    */
   void wait_for_writeable(MonOpRequestRef op, Context *c) {
     if (op)
-      op->mark_event(service_name + ":wait_for_writeable");
+      op->mark_event_string(service_name + ":wait_for_writeable");
 
     if (is_proposing())
       wait_for_finished_proposal(op, c);
@@ -777,6 +783,18 @@ public:
   void put_value(MonitorDBStore::TransactionRef t,
 		 const string& key, bufferlist& bl) {
     t->put(get_service_name(), key, bl);
+  }
+
+  /**
+   * Put integer value @v into the key @p key.
+   *
+   * @param t A transaction to which we will add this put operation
+   * @param key The key to which we will add the value
+   * @param v An integer
+   */
+  void put_value(MonitorDBStore::TransactionRef t,
+		 const string& key, version_t v) {
+    t->put(get_service_name(), key, v);
   }
 
   /**

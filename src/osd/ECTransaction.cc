@@ -101,12 +101,12 @@ void ECTransaction::generate_transactions(
   pg_t pgid,
   bool legacy_log_entries,
   const ECUtil::stripe_info_t &sinfo,
-  const hobject_t::bitwisemap<extent_map> &partial_extents,
+  const map<hobject_t,extent_map> &partial_extents,
   vector<pg_log_entry_t> &entries,
-  hobject_t::bitwisemap<extent_map> *written_map,
+  map<hobject_t,extent_map> *written_map,
   map<shard_id_t, ObjectStore::Transaction> *transactions,
-  set<hobject_t, hobject_t::BitwiseComparator> *temp_added,
-  set<hobject_t, hobject_t::BitwiseComparator> *temp_removed,
+  set<hobject_t> *temp_added,
+  set<hobject_t> *temp_removed,
   DoutPrefixProvider *dpp)
 {
   assert(written_map);
@@ -122,7 +122,7 @@ void ECTransaction::generate_transactions(
   assert(temp_added);
   assert(temp_removed);
 
-  map<hobject_t, pg_log_entry_t*, hobject_t::BitwiseComparator> obj_to_log;
+  map<hobject_t, pg_log_entry_t*> obj_to_log;
   for (auto &&i: entries) {
     obj_to_log.insert(make_pair(i.soid, &i));
   }
@@ -166,10 +166,10 @@ void ECTransaction::generate_transactions(
       if (entry &&
 	  entry->is_modify() &&
 	  op.updated_snaps) {
-	vector<snapid_t> snaps(
-	  op.updated_snaps->second.begin(),
-	  op.updated_snaps->second.end());
-	::encode(snaps, entry->snaps);
+	bufferlist bl(op.updated_snaps->second.size() * 8 + 8);
+	::encode(op.updated_snaps->second, bl);
+	entry->snaps.swap(bl);
+	entry->snaps.reassign_to_mempool(mempool::mempool_osd_pglog);
       }
 
       ldpp_dout(dpp, 20) << "generate_transactions: "

@@ -24,6 +24,7 @@
 #include "include/assert.h" // fio.h clobbers our assert.h
 
 #define dout_context g_ceph_context
+#define dout_subsys ceph_subsys_
 
 namespace {
 
@@ -83,7 +84,19 @@ struct Engine {
     std::lock_guard<std::mutex> l(lock);
     --ref_count;
     if (!ref_count) {
+      ostringstream ostr;
+      Formatter* f = Formatter::create("json-pretty", "json-pretty", "json-pretty");
+      os->dump_perf_counters(f);
+      ostr << "FIO plugin ";
+      f->flush(ostr);
+      if (g_conf->rocksdb_perf) {
+        os->get_db_statistics(f);
+        ostr << "FIO get_db_statistics ";
+        f->flush(ostr);
+      }
+      delete f;
       os->umount();
+      dout(0) <<  ostr.str() << dendl;
     }
   }
 };
@@ -117,7 +130,14 @@ Engine::Engine(const thread_data* td) : ref_count(0)
   if (!os)
     throw std::runtime_error("bad objectstore type " + g_conf->osd_objectstore);
 
-  os->set_cache_shards(g_conf->osd_op_num_shards);
+  unsigned num_shards;
+  if(g_conf->osd_op_num_shards)
+    num_shards = g_conf->osd_op_num_shards;
+  else if(os->is_rotational())
+    num_shards = g_conf->osd_op_num_shards_hdd;
+  else
+    num_shards = g_conf->osd_op_num_shards_ssd;
+  os->set_cache_shards(num_shards);
 
   int r = os->mkfs();
   if (r < 0)
@@ -143,7 +163,9 @@ struct Collection {
   static constexpr int64_t MIN_POOL_ID = 0x0000ffffffffffff;
 
   Collection(const spg_t& pg)
-    : pg(pg), cid(pg), sequencer(stringify(pg)) {}
+    : pg(pg), cid(pg), sequencer(stringify(pg)) {
+    sequencer.shard_hint = pg;
+  }
 };
 
 struct Object {
@@ -202,7 +224,7 @@ Job::Job(Engine* engine, const thread_data* td)
   for (uint32_t i = 0; i < td->o.nr_files; i++) {
     auto f = td->files[i];
     f->real_file_size = file_size;
-    f->engine_data = i;
+    f->engine_pos = i;
 
     // associate each object with a collection in a round-robin fashion
     auto& coll = collections[i % collections.size()];
@@ -322,7 +344,7 @@ int fio_ceph_os_queue(thread_data* td, io_u* u)
   fio_ro_check(td, u);
 
   auto job = static_cast<Job*>(td->io_ops_data);
-  auto& object = job->objects[u->file->engine_data];
+  auto& object = job->objects[u->file->engine_pos];
   auto& coll = object.coll;
   auto& os = job->engine->os;
 
@@ -331,12 +353,16 @@ int fio_ceph_os_queue(thread_data* td, io_u* u)
     const int flags = td_rw(td) ? CEPH_OSD_OP_FLAG_FADVISE_WILLNEED : 0;
 
     bufferlist bl;
-    bl.push_back(buffer::create_static(u->xfer_buflen,
-                                       static_cast<char*>(u->xfer_buf)));
+    bl.push_back(buffer::copy(reinterpret_cast<char*>(u->xfer_buf),
+                              u->xfer_buflen ) );
+
     // enqueue a write transaction on the collection's sequencer
     ObjectStore::Transaction t;
     t.write(coll.cid, object.oid, u->offset, u->xfer_buflen, bl, flags);
-    os->queue_transaction(&coll.sequencer, std::move(t), new UnitComplete(u));
+    os->queue_transaction(&coll.sequencer,
+                          std::move(t),
+                          nullptr,
+                          new UnitComplete(u));
     return FIO_Q_QUEUED;
   }
 

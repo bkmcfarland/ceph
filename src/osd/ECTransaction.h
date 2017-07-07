@@ -26,10 +26,10 @@ namespace ECTransaction {
   struct WritePlan {
     PGTransactionUPtr t;
     bool invalidates_cache = false; // Yes, both are possible
-    hobject_t::bitwisemap<extent_set> to_read;
-    hobject_t::bitwisemap<extent_set> will_write; // superset of to_read
+    map<hobject_t,extent_set> to_read;
+    map<hobject_t,extent_set> will_write; // superset of to_read
 
-    hobject_t::bitwisemap<ECUtil::HashInfoRef> hash_infos;
+    map<hobject_t,ECUtil::HashInfoRef> hash_infos;
   };
 
   bool requires_overwrite(
@@ -51,10 +51,6 @@ namespace ECTransaction {
 	uint64_t projected_size =
 	  hinfo->get_projected_total_logical_size(sinfo);
 
-	if (i.second.has_source()) {
-	  plan.invalidates_cache = true;
-	}
-
 	if (i.second.deletes_first()) {
 	  ldpp_dout(dpp, 20) << __func__ << ": delete, setting projected size"
 			     << " to 0" << dendl;
@@ -63,6 +59,8 @@ namespace ECTransaction {
 
 	hobject_t source;
 	if (i.second.has_source(&source)) {
+	  plan.invalidates_cache = true;
+
 	  ECUtil::HashInfoRef shinfo = get_hinfo(source);
 	  projected_size = shinfo->get_projected_total_logical_size(sinfo);
 	  plan.hash_infos[source] = shinfo;
@@ -98,6 +96,7 @@ namespace ECTransaction {
 	  raw_write_set.insert(extent.get_off(), extent.get_len());
 	}
 
+	auto orig_size = projected_size;
 	for (auto extent = raw_write_set.begin();
 	     extent != raw_write_set.end();
 	     ++extent) {
@@ -109,9 +108,12 @@ namespace ECTransaction {
 	    head_start = projected_size;
 	  }
 	  if (head_start != head_finish &&
-	      head_start < projected_size) {
-	    assert(head_finish <= projected_size);
+	      head_start < orig_size) {
+	    assert(head_finish <= orig_size);
 	    assert(head_finish - head_start == sinfo.get_stripe_width());
+	    ldpp_dout(dpp, 20) << __func__ << ": reading partial head stripe "
+			       << head_start << "~" << sinfo.get_stripe_width()
+			       << dendl;
 	    plan.to_read[i.first].union_insert(
 	      head_start, sinfo.get_stripe_width());
 	  }
@@ -124,9 +126,12 @@ namespace ECTransaction {
 	      extent.get_start() + extent.get_len());
 	  if (tail_start != tail_finish &&
 	      (head_start == head_finish || tail_start != head_start) &&
-	      tail_start < projected_size) {
-	    assert(tail_finish <= projected_size);
+	      tail_start < orig_size) {
+	    assert(tail_finish <= orig_size);
 	    assert(tail_finish - tail_start == sinfo.get_stripe_width());
+	    ldpp_dout(dpp, 20) << __func__ << ": reading partial tail stripe "
+			       << tail_start << "~" << sinfo.get_stripe_width()
+			       << dendl;
 	    plan.to_read[i.first].union_insert(
 	      tail_start, sinfo.get_stripe_width());
 	  }
@@ -152,7 +157,8 @@ namespace ECTransaction {
 	  ldpp_dout(dpp, 20) << __func__ << ": truncating out to "
 			     <<  truncating_to
 			     << dendl;
-	  will_write.union_insert(projected_size, truncating_to - projected_size);
+	  will_write.union_insert(projected_size,
+				  truncating_to - projected_size);
 	  projected_size = truncating_to;
 	}
 
@@ -182,12 +188,12 @@ namespace ECTransaction {
     pg_t pgid,
     bool legacy_log_entries,
     const ECUtil::stripe_info_t &sinfo,
-    const hobject_t::bitwisemap<extent_map> &partial_extents,
+    const map<hobject_t,extent_map> &partial_extents,
     vector<pg_log_entry_t> &entries,
-    hobject_t::bitwisemap<extent_map> *written,
+    map<hobject_t,extent_map> *written,
     map<shard_id_t, ObjectStore::Transaction> *transactions,
-    set<hobject_t, hobject_t::BitwiseComparator> *temp_added,
-    set<hobject_t, hobject_t::BitwiseComparator> *temp_removed,
+    set<hobject_t> *temp_added,
+    set<hobject_t> *temp_removed,
     DoutPrefixProvider *dpp);
 };
 

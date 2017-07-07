@@ -59,9 +59,15 @@ class MgrModule(object):
 
         self._logger.addHandler(CPlusPlusHandler())
 
+        self._version = ceph_state.get_version()
+
     @property
     def log(self):
         return self._logger
+
+    @property
+    def version(self):
+        return self._version
 
     def notify(self, notify_type, notify_id):
         """
@@ -159,6 +165,14 @@ class MgrModule(object):
         # any ``COMMANDS``
         raise NotImplementedError()
 
+    def get_mgr_id(self):
+        """
+        Retrieve the mgr id.
+
+        :return: str
+        """
+        return ceph_state.get_mgr_id()
+
     def get_config(self, key):
         """
         Retrieve the value of a persistent configuration setting
@@ -168,6 +182,30 @@ class MgrModule(object):
         """
         return ceph_state.get_config(self._handle, key)
 
+    def get_config_prefix(self, key_prefix):
+        """
+        Retrieve a dict of config values with the given prefix
+
+        :param key_prefix: str
+        :return: str
+        """
+        return ceph_state.get_config_prefix(self._handle, key_prefix)
+
+    def get_localized_config(self, key, default=None):
+        """
+        Retrieve localized configuration for this ceph-mgr instance
+        :param key: str
+        :param default: str
+        :return: str
+        """
+        r = self.get_config(self.get_mgr_id() + '/' + key)
+        if r is None:
+            r = self.get_config(key)
+
+        if r is None:
+            r = default
+        return r
+
     def set_config(self, key, val):
         """
         Set the value of a persistent configuration setting
@@ -176,6 +214,15 @@ class MgrModule(object):
         :param val: str
         """
         ceph_state.set_config(self._handle, key, val)
+
+    def set_localized_config(self, key, val):
+        """
+        Set localized configuration for this ceph-mgr instance
+        :param key: str
+        :param default: str
+        :return: str
+        """
+        return self.set_config(self.get_mgr_id() + '/' + key, val)
 
     def set_config_json(self, key, val):
         """
@@ -198,3 +245,11 @@ class MgrModule(object):
             return None
         else:
             return json.loads(raw)
+
+    def self_test(self):
+        """
+        Run a self-test on the module. Override this function and implement
+        a best as possible self-test for (automated) testing of the module
+        :return: bool
+        """
+        pass

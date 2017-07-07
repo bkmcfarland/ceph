@@ -79,10 +79,11 @@ public:
   int init_messenger() {
     dout(1) << __func__ << dendl;
 
-    msg = Messenger::create(cct, cct->_conf->ms_type, entity_name_t::CLIENT(-1),
+    std::string public_msgr_type = cct->_conf->ms_public_type.empty() ? cct->_conf->get_val<std::string>("ms_type") : cct->_conf->ms_public_type;
+    msg = Messenger::create(cct, public_msgr_type, entity_name_t::CLIENT(-1),
                             "test-mon-msg", 0, 0);
     assert(msg != NULL);
-    msg->set_default_policy(Messenger::Policy::lossy_client(0,0));
+    msg->set_default_policy(Messenger::Policy::lossy_client(0));
     dout(0) << __func__ << " starting messenger at "
             << msg->get_myaddr() << dendl;
     msg->start();
@@ -182,13 +183,13 @@ fail:
     return true;
   }
 
-  bool ms_dispatch(Message *m) {
+  bool ms_dispatch(Message *m) override {
     return handle_message(m);  
   }
-  void ms_handle_connect(Connection *con) { }
-  void ms_handle_remote_reset(Connection *con) { }
-  bool ms_handle_reset(Connection *con) { return false; }
-  bool ms_handle_refused(Connection *con) { return false; }
+  void ms_handle_connect(Connection *con) override { }
+  void ms_handle_remote_reset(Connection *con) override { }
+  bool ms_handle_reset(Connection *con) override { return false; }
+  bool ms_handle_refused(Connection *con) override { return false; }
 
   bool is_wanted(Message *m) {
     dout(20) << __func__ << " " << *m << " type " << m->get_type() << dendl;
@@ -218,7 +219,7 @@ class MonMsgTest : public MonClientHelper,
 {
 protected:
   int reply_type;
-  Message *reply_msg;
+  Message *reply_msg = nullptr;
   Mutex lock;
   Cond cond;
 
@@ -227,24 +228,24 @@ protected:
     lock("lock") { }
 
 public:
-  virtual void SetUp() {
+  void SetUp() override {
     reply_type = -1;
     if (reply_msg) {
       reply_msg->put();
-      reply_msg = NULL;
+      reply_msg = nullptr;
     }
     ASSERT_EQ(init(), 0);
   }
 
-  virtual void TearDown() {
+  void TearDown() override {
     shutdown();
     if (reply_msg) {
       reply_msg->put();
-      reply_msg = NULL;
+      reply_msg = nullptr;
     }
   }
 
-  void handle_wanted(Message *m) {
+  void handle_wanted(Message *m) override {
     lock.Lock();
     // caller will put() after they call us, so hold on to a ref
     m->get();
@@ -278,7 +279,7 @@ public:
     }
 
     if (!reply_msg)
-      dout(20) << __func__ << " reply_msg is NULL" << dendl;
+      dout(20) << __func__ << " reply_msg is nullptr" << dendl;
     else
       dout(20) << __func__ << " reply_msg " << *reply_msg << dendl;
     return reply_msg;

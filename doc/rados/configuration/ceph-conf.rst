@@ -383,8 +383,9 @@ use with Ceph, and mount it to the directory you just created::
 	sudo mkfs -t {fstype} /dev/{disk}
 	sudo mount -o user_xattr /dev/{hdd} /var/lib/ceph/osd/ceph-{osd-number}
 
-We recommend using the ``xfs`` file system or the ``btrfs`` file system when
-running :command:`mkfs`.
+We recommend using the ``xfs`` file system when running
+:command:`mkfs`.  (``btrfs`` and ``ext4`` are not recommended and no
+longer tested.)
 
 See the `OSD Config Reference`_ for additional configuration details.
 
@@ -524,7 +525,6 @@ To invoke a cluster other than the default ``ceph`` cluster, use the
 
 
 .. _Hardware Recommendations: ../../../start/hardware-recommendations
-.. _hardware recommendations: ../../../start/hardware-recommendations
 .. _Network Configuration Reference: ../network-config-ref
 .. _OSD Config Reference: ../osd-config-ref
 .. _Configuring Monitor/OSD Interaction: ../mon-osd-interaction

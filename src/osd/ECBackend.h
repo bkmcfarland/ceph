@@ -34,63 +34,72 @@ struct ECSubReadReply;
 struct RecoveryMessages;
 class ECBackend : public PGBackend {
 public:
-  RecoveryHandle *open_recovery_op();
+  RecoveryHandle *open_recovery_op() override;
 
   void run_recovery_op(
     RecoveryHandle *h,
     int priority
-    );
+    ) override;
 
-  void recover_object(
+  int recover_object(
     const hobject_t &hoid,
     eversion_t v,
     ObjectContextRef head,
     ObjectContextRef obc,
     RecoveryHandle *h
-    );
+    ) override;
 
   bool handle_message(
     OpRequestRef op
-    );
+    ) override;
   bool can_handle_while_inactive(
     OpRequestRef op
-    );
+    ) override;
   friend struct SubWriteApplied;
   friend struct SubWriteCommitted;
   void sub_write_applied(
-    ceph_tid_t tid, eversion_t version);
+    ceph_tid_t tid,
+    eversion_t version,
+    const ZTracer::Trace &trace);
   void sub_write_committed(
-    ceph_tid_t tid, eversion_t version, eversion_t last_complete);
+    ceph_tid_t tid,
+    eversion_t version,
+    eversion_t last_complete,
+    const ZTracer::Trace &trace);
   void handle_sub_write(
     pg_shard_t from,
     OpRequestRef msg,
     ECSubWrite &op,
+    const ZTracer::Trace &trace,
     Context *on_local_applied_sync = 0
     );
   void handle_sub_read(
     pg_shard_t from,
-    ECSubRead &op,
-    ECSubReadReply *reply
+    const ECSubRead &op,
+    ECSubReadReply *reply,
+    const ZTracer::Trace &trace
     );
   void handle_sub_write_reply(
     pg_shard_t from,
-    ECSubWriteReply &op
+    const ECSubWriteReply &op,
+    const ZTracer::Trace &trace
     );
   void handle_sub_read_reply(
     pg_shard_t from,
     ECSubReadReply &op,
-    RecoveryMessages *m
+    RecoveryMessages *m,
+    const ZTracer::Trace &trace
     );
 
   /// @see ReadOp below
-  void check_recovery_sources(const OSDMapRef& osdmap);
+  void check_recovery_sources(const OSDMapRef& osdmap) override;
 
-  void on_change();
-  void clear_recovery_state();
+  void on_change() override;
+  void clear_recovery_state() override;
 
-  void on_flushed();
+  void on_flushed() override;
 
-  void dump_recovery_info(Formatter *f) const;
+  void dump_recovery_info(Formatter *f) const override;
 
   void call_write_ordered(std::function<void(void)> &&cb) override;
 
@@ -109,14 +118,14 @@ public:
     ceph_tid_t tid,
     osd_reqid_t reqid,
     OpRequestRef op
-    );
+    ) override;
 
   int objects_read_sync(
     const hobject_t &hoid,
     uint64_t off,
     uint64_t len,
     uint32_t op_flags,
-    bufferlist *bl);
+    bufferlist *bl) override;
 
   /**
    * Async read mechanism
@@ -137,20 +146,19 @@ public:
    * check_recovery_sources.
    */
   void objects_read_and_reconstruct(
-    const hobject_t::bitwisemap<
-      std::list<boost::tuple<uint64_t, uint64_t, uint32_t> >
+    const map<hobject_t, std::list<boost::tuple<uint64_t, uint64_t, uint32_t> >
     > &reads,
     bool fast_read,
-    GenContextURef<hobject_t::bitwisemap<pair<int, extent_map> > &&> &&func);
+    GenContextURef<map<hobject_t,pair<int, extent_map> > &&> &&func);
 
   friend struct CallClientContexts;
   struct ClientAsyncReadStatus {
     unsigned objects_to_read;
-    GenContextURef<hobject_t::bitwisemap<pair<int, extent_map> > &&> func;
-    hobject_t::bitwisemap<pair<int, extent_map> > results;
+    GenContextURef<map<hobject_t,pair<int, extent_map> > &&> func;
+    map<hobject_t,pair<int, extent_map> > results;
     explicit ClientAsyncReadStatus(
       unsigned objects_to_read,
-      GenContextURef<hobject_t::bitwisemap<pair<int, extent_map> > &&> &&func)
+      GenContextURef<map<hobject_t,pair<int, extent_map> > &&> &&func)
       : objects_to_read(objects_to_read), func(std::move(func)) {}
     void complete_object(
       const hobject_t &hoid,
@@ -174,14 +182,13 @@ public:
     const list<pair<boost::tuple<uint64_t, uint64_t, uint32_t>,
 		    pair<bufferlist*, Context*> > > &to_read,
     Context *on_complete,
-    bool fast_read = false);
+    bool fast_read = false) override;
 
   template <typename Func>
   void objects_read_async_no_cache(
-    const hobject_t::bitwisemap<extent_set> &to_read,
+    const map<hobject_t,extent_set> &to_read,
     Func &&on_complete) {
-    hobject_t::bitwisemap<
-      std::list<boost::tuple<uint64_t, uint64_t, uint32_t> > > _to_read;
+    map<hobject_t,std::list<boost::tuple<uint64_t, uint64_t, uint32_t> > > _to_read;
     for (auto &&hpair: to_read) {
       auto &l = _to_read[hpair.first];
       for (auto extent: hpair.second) {
@@ -192,7 +199,7 @@ public:
       _to_read,
       false,
       make_gen_lambda_context<
-        hobject_t::bitwisemap<pair<int, extent_map> > &&, Func>(
+      map<hobject_t,pair<int, extent_map> > &&, Func>(
 	  std::forward<Func>(on_complete)));
   }
   void kick_reads() {
@@ -294,7 +301,7 @@ private:
     RecoveryOp() : state(IDLE) {}
   };
   friend ostream &operator<<(ostream &lhs, const RecoveryOp &rhs);
-  map<hobject_t, RecoveryOp, hobject_t::BitwiseComparator> recovery_ops;
+  map<hobject_t, RecoveryOp> recovery_ops;
 
   void continue_recovery_op(
     RecoveryOp &op,
@@ -307,10 +314,10 @@ private:
     boost::optional<map<string, bufferlist> > attrs,
     RecoveryMessages *m);
   void handle_recovery_push(
-    PushOp &op,
+    const PushOp &op,
     RecoveryMessages *m);
   void handle_recovery_push_reply(
-    PushReplyOp &op,
+    const PushReplyOp &op,
     pg_shard_t from,
     RecoveryMessages *m);
 
@@ -372,11 +379,13 @@ public:
     // of the available shards.
     bool for_recovery;
 
-    map<hobject_t, read_request_t, hobject_t::BitwiseComparator> to_read;
-    map<hobject_t, read_result_t, hobject_t::BitwiseComparator> complete;
+    ZTracer::Trace trace;
 
-    map<hobject_t, set<pg_shard_t>, hobject_t::BitwiseComparator> obj_to_source;
-    map<pg_shard_t, set<hobject_t, hobject_t::BitwiseComparator> > source_to_obj;
+    map<hobject_t, read_request_t> to_read;
+    map<hobject_t, read_result_t> complete;
+
+    map<hobject_t, set<pg_shard_t>> obj_to_source;
+    map<pg_shard_t, set<hobject_t> > source_to_obj;
 
     void dump(Formatter *f) const;
 
@@ -388,7 +397,7 @@ public:
       bool do_redundant_reads,
       bool for_recovery,
       OpRequestRef op,
-      map<hobject_t, read_request_t, hobject_t::BitwiseComparator> &&_to_read)
+      map<hobject_t, read_request_t> &&_to_read)
       : priority(priority), tid(tid), op(op), do_redundant_reads(do_redundant_reads),
 	for_recovery(for_recovery), to_read(std::move(_to_read)) {
       for (auto &&hpair: to_read) {
@@ -416,7 +425,7 @@ public:
   map<pg_shard_t, set<ceph_tid_t> > shard_to_read_map;
   void start_read_op(
     int priority,
-    map<hobject_t, read_request_t, hobject_t::BitwiseComparator> &to_read,
+    map<hobject_t, read_request_t> &to_read,
     OpRequestRef op,
     bool do_redundant_reads, bool for_recovery);
 
@@ -449,18 +458,19 @@ public:
     vector<pg_log_entry_t> log_entries;
     ceph_tid_t tid;
     osd_reqid_t reqid;
+    ZTracer::Trace trace;
 
     eversion_t roll_forward_to; /// Soon to be generated internally
 
     /// Ancillary also provided from submit_transaction caller
-    map<hobject_t, ObjectContextRef, hobject_t::BitwiseComparator> obc_map;
+    map<hobject_t, ObjectContextRef> obc_map;
 
     /// see call_write_ordered
     std::list<std::function<void(void)> > on_write;
 
     /// Generated internally
-    set<hobject_t, hobject_t::BitwiseComparator> temp_added;
-    set<hobject_t, hobject_t::BitwiseComparator> temp_cleared;
+    set<hobject_t> temp_added;
+    set<hobject_t> temp_cleared;
 
     ECTransaction::WritePlan plan;
     bool requires_rmw() const { return !plan.to_read.empty(); }
@@ -470,9 +480,9 @@ public:
     bool using_cache = false;
 
     /// In progress read state;
-    hobject_t::bitwisemap<extent_set> pending_read; // subset already being read
-    hobject_t::bitwisemap<extent_set> remote_read;  // subset we must read
-    hobject_t::bitwisemap<extent_map> remote_read_result;
+    map<hobject_t,extent_set> pending_read; // subset already being read
+    map<hobject_t,extent_set> remote_read;  // subset we must read
+    map<hobject_t,extent_map> remote_read_result;
     bool read_in_progress() const {
       return !remote_read.empty() && remote_read_result.empty();
     }
@@ -576,7 +586,7 @@ public:
 	want.insert(i);
       }
     }
-    bool operator()(const set<pg_shard_t> &_have) const {
+    bool operator()(const set<pg_shard_t> &_have) const override {
       set<int> have;
       for (set<pg_shard_t>::const_iterator i = _have.begin();
 	   i != _have.end();
@@ -587,7 +597,7 @@ public:
       return ec_impl->minimum_to_decode(want, have, &min) == 0;
     }
   };
-  IsPGRecoverablePredicate *get_is_recoverable_predicate() {
+  IsPGRecoverablePredicate *get_is_recoverable_predicate() override {
     return new ECRecPred(ec_impl);
   }
 
@@ -603,18 +613,18 @@ public:
     ECReadPred(
       pg_shard_t whoami,
       ErasureCodeInterfaceRef ec_impl) : whoami(whoami), rec_pred(ec_impl) {}
-    bool operator()(const set<pg_shard_t> &_have) const {
+    bool operator()(const set<pg_shard_t> &_have) const override {
       return _have.count(whoami) && rec_pred(_have);
     }
   };
-  IsPGReadablePredicate *get_is_readable_predicate() {
+  IsPGReadablePredicate *get_is_readable_predicate() override {
     return new ECReadPred(get_parent()->whoami_shard(), ec_impl);
   }
 
 
   const ECUtil::stripe_info_t sinfo;
   /// If modified, ensure that the ref is held until the update is applied
-  SharedPtrRegistry<hobject_t, ECUtil::HashInfo, hobject_t::BitwiseComparator> unstable_hashinfo_registry;
+  SharedPtrRegistry<hobject_t, ECUtil::HashInfo> unstable_hashinfo_registry;
   ECUtil::HashInfoRef get_hash_info(const hobject_t &hoid, bool checks = true,
 				    const map<string,bufferptr> *attr = NULL);
 
@@ -644,22 +654,22 @@ public:
 
   int objects_get_attrs(
     const hobject_t &hoid,
-    map<string, bufferlist> *out);
+    map<string, bufferlist> *out) override;
 
   void rollback_append(
     const hobject_t &hoid,
     uint64_t old_size,
-    ObjectStore::Transaction *t);
+    ObjectStore::Transaction *t) override;
 
-  bool scrub_supported() { return true; }
-  bool auto_repair_supported() const { return true; }
+  bool scrub_supported() override { return true; }
+  bool auto_repair_supported() const override { return true; }
 
   void be_deep_scrub(
     const hobject_t &obj,
     uint32_t seed,
     ScrubMap::object &o,
-    ThreadPool::TPHandle &handle);
-  uint64_t be_get_ondisk_size(uint64_t logical_size) {
+    ThreadPool::TPHandle &handle) override;
+  uint64_t be_get_ondisk_size(uint64_t logical_size) override {
     return sinfo.logical_to_next_chunk_offset(logical_size);
   }
   void _failed_push(const hobject_t &hoid,

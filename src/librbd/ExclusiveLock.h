@@ -5,7 +5,7 @@
 #define CEPH_LIBRBD_EXCLUSIVE_LOCK_H
 
 #include "librbd/ManagedLock.h"
-#include "librbd/ImageCtx.h"
+#include "common/AsyncOpTracker.h"
 
 namespace librbd {
 
@@ -18,7 +18,8 @@ public:
 
   ExclusiveLock(ImageCtxT &image_ctx);
 
-  bool accept_requests(int *ret_val) const;
+  bool accept_requests(int *ret_val = nullptr) const;
+  bool accept_ops() const;
 
   void block_requests(int r);
   void unblock_requests();
@@ -28,14 +29,17 @@ public:
 
   void handle_peer_notification(int r);
 
+  Context *start_op();
+
 protected:
-  virtual void shutdown_handler(int r, Context *on_finish);
-  virtual void pre_acquire_lock_handler(Context *on_finish);
-  virtual void post_acquire_lock_handler(int r, Context *on_finish);
-  virtual void pre_release_lock_handler(bool shutting_down,
-                                        Context *on_finish);
-  virtual void post_release_lock_handler(bool shutting_down, int r,
-                                         Context *on_finish);
+  void shutdown_handler(int r, Context *on_finish) override;
+  void pre_acquire_lock_handler(Context *on_finish) override;
+  void post_acquire_lock_handler(int r, Context *on_finish) override;
+  void pre_release_lock_handler(bool shutting_down,
+                                Context *on_finish) override;
+  void post_release_lock_handler(bool shutting_down, int r,
+                                 Context *on_finish) override;
+  void post_reacquire_lock_handler(int r, Context *on_finish) override;
 
 private:
 
@@ -77,33 +81,23 @@ private:
    * @endverbatim
    */
 
-  struct C_InitComplete : public Context {
-    ExclusiveLock *exclusive_lock;
-    Context *on_init;
-    C_InitComplete(ExclusiveLock *exclusive_lock, Context *on_init)
-      : exclusive_lock(exclusive_lock), on_init(on_init) {
-    }
-    virtual void finish(int r) override {
-      if (r == 0) {
-        exclusive_lock->handle_init_complete();
-      }
-      on_init->complete(r);
-    }
-  };
+  struct C_InitComplete;
 
   ImageCtxT& m_image_ctx;
-  Context *m_pre_post_callback;
-  bool m_shutting_down;
+  Context *m_pre_post_callback = nullptr;
+
+  AsyncOpTracker m_async_op_tracker;
 
   uint32_t m_request_blocked_count = 0;
   int m_request_blocked_ret_val = 0;
 
   int m_acquire_lock_peer_ret_val = 0;
 
-  void handle_init_complete();
+  bool accept_ops(const Mutex &lock) const;
+
+  void handle_init_complete(uint64_t features);
   void handle_post_acquiring_lock(int r);
   void handle_post_acquired_lock(int r);
-  void handle_pre_releasing_lock(int r);
 };
 
 } // namespace librbd

@@ -306,6 +306,27 @@ int SimpleMessenger::rebind(const set<int>& avoid_ports)
   return accepter.rebind(avoid_ports);
 }
 
+
+int SimpleMessenger::client_bind(const entity_addr_t &bind_addr)
+{
+  if (!cct->_conf->ms_bind_before_connect)
+    return 0;
+  Mutex::Locker l(lock);
+  if (did_bind) {
+    assert(my_inst.addr == bind_addr);
+    return 0;
+  }
+  if (started) {
+    ldout(cct,10) << "rank.bind already started" << dendl;
+    return -1;
+  }
+  ldout(cct,10) << "rank.bind " << bind_addr << dendl;
+
+  set_myaddr(bind_addr);
+  return 0;
+}
+
+
 int SimpleMessenger::start()
 {
   lock.Lock();
@@ -424,6 +445,7 @@ void SimpleMessenger::submit_message(Message *m, PipeConnection *con,
 				     const entity_addr_t& dest_addr, int dest_type,
 				     bool already_locked)
 {
+  m->trace.event("simple submitting message");
   if (cct->_conf->ms_dump_on_send) {
     m->encode(-1, true);
     ldout(cct, 0) << "submit_message " << *m << "\n";

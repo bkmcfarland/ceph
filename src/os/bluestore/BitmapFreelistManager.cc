@@ -3,7 +3,7 @@
 
 #include "BitmapFreelistManager.h"
 #include "kv/KeyValueDB.h"
-#include "kv.h"
+#include "os/kv.h"
 
 #include "common/debug.h"
 
@@ -19,14 +19,14 @@ void make_offset_key(uint64_t offset, std::string *key)
 }
 
 struct XorMergeOperator : public KeyValueDB::MergeOperator {
-  virtual void merge_nonexistent(
+  void merge_nonexistent(
     const char *rdata, size_t rlen, std::string *new_value) override {
     *new_value = std::string(rdata, rlen);
   }
-  virtual void merge(
+  void merge(
     const char *ldata, size_t llen,
     const char *rdata, size_t rlen,
-    std::string *new_value) {
+    std::string *new_value) override {
     assert(llen == rlen);
     *new_value = std::string(ldata, llen);
     for (size_t i = 0; i < rlen; ++i) {
@@ -35,7 +35,7 @@ struct XorMergeOperator : public KeyValueDB::MergeOperator {
   }
   // We use each operator name and each prefix to construct the
   // overall RocksDB operator name for consistency check at open time.
-  virtual string name() const {
+  string name() const override {
     return "bitwise_xor";
   }
 };
@@ -190,9 +190,10 @@ int get_next_clear_bit(bufferlist& bl, int start)
   const char *p = bl.c_str();
   int bits = bl.length() << 3;
   while (start < bits) {
-    int byte = start >> 3;
-    unsigned char mask = 1 << (start & 7);
-    if ((p[byte] & mask) == 0) {
+    int which_byte = start / 8;
+    int which_bit = start % 8;
+    unsigned char byte_mask = 1 << which_bit;
+    if ((p[which_byte] & byte_mask) == 0) {
       return start;
     }
     ++start;
@@ -205,9 +206,10 @@ int get_next_set_bit(bufferlist& bl, int start)
   const char *p = bl.c_str();
   int bits = bl.length() << 3;
   while (start < bits) {
-    int byte = start >> 3;
-    unsigned char mask = 1 << (start & 7);
-    if (p[byte] & mask) {
+    int which_byte = start / 8;
+    int which_bit = start % 8;
+    unsigned char byte_mask = 1 << which_bit;
+    if (p[which_byte] & byte_mask) {
       return start;
     }
     ++start;
@@ -244,7 +246,7 @@ bool BitmapFreelistManager::enumerate_next(uint64_t *offset, uint64_t *length)
   while (true) {
     enumerate_bl_pos = get_next_clear_bit(enumerate_bl, enumerate_bl_pos);
     if (enumerate_bl_pos >= 0) {
-      *offset = get_offset(enumerate_offset, enumerate_bl_pos);
+      *offset = _get_offset(enumerate_offset, enumerate_bl_pos);
       dout(30) << __func__ << " found clear bit, key 0x" << std::hex
 	       << enumerate_offset << " bit 0x" << enumerate_bl_pos
 	       << " offset 0x" << *offset
@@ -258,7 +260,7 @@ bool BitmapFreelistManager::enumerate_next(uint64_t *offset, uint64_t *length)
     if (!enumerate_p->valid()) {
       enumerate_offset += bytes_per_key;
       enumerate_bl_pos = 0;
-      *offset = get_offset(enumerate_offset, enumerate_bl_pos);
+      *offset = _get_offset(enumerate_offset, enumerate_bl_pos);
       break;
     }
     string k = enumerate_p->key();
@@ -281,15 +283,15 @@ bool BitmapFreelistManager::enumerate_next(uint64_t *offset, uint64_t *length)
     while (true) {
       enumerate_bl_pos = get_next_set_bit(enumerate_bl, enumerate_bl_pos);
       if (enumerate_bl_pos >= 0) {
-	end = get_offset(enumerate_offset, enumerate_bl_pos);
+	end = _get_offset(enumerate_offset, enumerate_bl_pos);
 	dout(30) << __func__ << " found set bit, key 0x" << std::hex
 		 << enumerate_offset << " bit 0x" << enumerate_bl_pos
 		 << " offset 0x" << end << std::dec
 		 << dendl;
 	*length = end - *offset;
-       assert((*offset  + *length) <= size);
-       dout(10) << __func__ << std::hex << " 0x" << *offset << "~" << *length
-		<< std::dec << dendl;
+        assert((*offset  + *length) <= size);
+        dout(10) << __func__ << std::hex << " 0x" << *offset << "~" << *length
+		 << std::dec << dendl;
 	return true;
       }
       dout(30) << " no more set bits in 0x" << std::hex << enumerate_offset

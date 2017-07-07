@@ -152,6 +152,7 @@ class EventCenter {
 
  private:
   CephContext *cct;
+  std::string type;
   int nevent;
   // Used only to external event
   pthread_t owner;
@@ -190,7 +191,7 @@ class EventCenter {
   ~EventCenter();
   ostream& _event_prefix(std::ostream *_dout);
 
-  int init(int nevent, unsigned idx);
+  int init(int nevent, unsigned idx, const std::string &t);
   void set_owner();
   pthread_t get_owner() const { return owner; }
   unsigned get_id() const { return idx; }
@@ -202,7 +203,7 @@ class EventCenter {
   uint64_t create_time_event(uint64_t milliseconds, EventCallbackRef ctxt);
   void delete_file_event(int fd, int mask);
   void delete_time_event(uint64_t id);
-  int process_events(int timeout_microseconds);
+  int process_events(int timeout_microseconds, ceph::timespan *working_dur = nullptr);
   void wakeup();
 
   // Used by external thread
@@ -222,7 +223,7 @@ class EventCenter {
    public:
     C_submit_event(func &&_f, bool nw)
       : f(std::move(_f)), nonwait(nw) {}
-    void do_request(int id) {
+    void do_request(int id) override {
       f();
       lock.lock();
       cond.notify_all();

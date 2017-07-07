@@ -56,6 +56,10 @@ TracepointProvider::Traits osd_tracepoint_traits("libosd_tp.so",
                                                  "osd_tracing");
 TracepointProvider::Traits os_tracepoint_traits("libos_tp.so",
                                                 "osd_objectstore_tracing");
+#ifdef WITH_OSD_INSTRUMENT_FUNCTIONS
+TracepointProvider::Traits cyg_profile_traits("libcyg_profile_tp.so",
+                                                 "osd_function_tracing");
+#endif
 
 } // anonymous namespace
 
@@ -69,11 +73,12 @@ void handle_osd_signal(int signum)
 
 static void usage()
 {
-  cout << "usage: ceph-osd -i <osdid>\n"
+  cout << "usage: ceph-osd -i <ID> [flags]\n"
        << "  --osd-data PATH data directory\n"
        << "  --osd-journal PATH\n"
        << "                    journal file or block device\n"
        << "  --mkfs            create a [new] data directory\n"
+       << "  --mkkey           generate a new secret key. This is normally used in combination with --mkfs\n"
        << "  --convert-filestore\n"
        << "                    run any pending upgrade operations\n"
        << "  --flush-journal   flush all data out of journal\n"
@@ -268,6 +273,11 @@ int main(int argc, const char **argv)
     if (mc.get_monmap_privately() < 0)
       return -1;
 
+    if (mc.monmap.fsid.is_zero()) {
+      derr << "must specify cluster fsid" << dendl;
+      return -EINVAL;
+    }
+
     int err = OSD::mkfs(g_ceph_context, store, g_conf->osd_data,
 			mc.monmap.fsid, whoami);
     if (err < 0) {
@@ -355,13 +365,15 @@ int main(int argc, const char **argv)
       derr << TEXT_RED << " ** ERROR: error flushing journal " << g_conf->osd_journal
 	   << " for object store " << g_conf->osd_data
 	   << ": " << cpp_strerror(-err) << TEXT_NORMAL << dendl;
-      exit(1);
+      goto flushjournal_out;
     }
     store->umount();
     derr << "flushed journal " << g_conf->osd_journal
 	 << " for object store " << g_conf->osd_data
 	 << dendl;
-    exit(0);
+flushjournal_out:
+    delete store;
+    exit(err < 0 ? 1 : 0);
   }
   if (dump_journal) {
     common_init_finish(g_ceph_context);
@@ -440,32 +452,38 @@ int main(int argc, const char **argv)
 	 << TEXT_NORMAL << dendl;
   }
 
-  Messenger *ms_public = Messenger::create(g_ceph_context, g_conf->ms_type,
+  std::string public_msgr_type = g_conf->ms_public_type.empty() ? g_conf->get_val<std::string>("ms_type") : g_conf->ms_public_type;
+  std::string cluster_msgr_type = g_conf->ms_cluster_type.empty() ? g_conf->get_val<std::string>("ms_type") : g_conf->ms_cluster_type;
+  Messenger *ms_public = Messenger::create(g_ceph_context, public_msgr_type,
 					   entity_name_t::OSD(whoami), "client",
 					   getpid(),
 					   Messenger::HAS_HEAVY_TRAFFIC |
 					   Messenger::HAS_MANY_CONNECTIONS);
-  Messenger *ms_cluster = Messenger::create(g_ceph_context, g_conf->ms_type,
+  Messenger *ms_cluster = Messenger::create(g_ceph_context, cluster_msgr_type,
 					    entity_name_t::OSD(whoami), "cluster",
 					    getpid(),
 					    Messenger::HAS_HEAVY_TRAFFIC |
 					    Messenger::HAS_MANY_CONNECTIONS);
-  Messenger *ms_hbclient = Messenger::create(g_ceph_context, g_conf->ms_type,
-					     entity_name_t::OSD(whoami), "hbclient",
+  Messenger *ms_hb_back_client = Messenger::create(g_ceph_context, cluster_msgr_type,
+					     entity_name_t::OSD(whoami), "hb_back_client",
 					     getpid(), Messenger::HEARTBEAT);
-  Messenger *ms_hb_back_server = Messenger::create(g_ceph_context, g_conf->ms_type,
+  Messenger *ms_hb_front_client = Messenger::create(g_ceph_context, public_msgr_type,
+					     entity_name_t::OSD(whoami), "hb_front_client",
+					     getpid(), Messenger::HEARTBEAT);
+  Messenger *ms_hb_back_server = Messenger::create(g_ceph_context, cluster_msgr_type,
 						   entity_name_t::OSD(whoami), "hb_back_server",
 						   getpid(), Messenger::HEARTBEAT);
-  Messenger *ms_hb_front_server = Messenger::create(g_ceph_context, g_conf->ms_type,
+  Messenger *ms_hb_front_server = Messenger::create(g_ceph_context, public_msgr_type,
 						    entity_name_t::OSD(whoami), "hb_front_server",
 						    getpid(), Messenger::HEARTBEAT);
-  Messenger *ms_objecter = Messenger::create(g_ceph_context, g_conf->ms_type,
+  Messenger *ms_objecter = Messenger::create(g_ceph_context, public_msgr_type,
 					     entity_name_t::OSD(whoami), "ms_objecter",
 					     getpid(), 0);
-  if (!ms_public || !ms_cluster || !ms_hbclient || !ms_hb_back_server || !ms_hb_front_server || !ms_objecter)
+  if (!ms_public || !ms_cluster || !ms_hb_front_client || !ms_hb_back_client || !ms_hb_back_server || !ms_hb_front_server || !ms_objecter)
     exit(1);
   ms_cluster->set_cluster_protocol(CEPH_OSD_PROTOCOL);
-  ms_hbclient->set_cluster_protocol(CEPH_OSD_PROTOCOL);
+  ms_hb_front_client->set_cluster_protocol(CEPH_OSD_PROTOCOL);
+  ms_hb_back_client->set_cluster_protocol(CEPH_OSD_PROTOCOL);
   ms_hb_back_server->set_cluster_protocol(CEPH_OSD_PROTOCOL);
   ms_hb_front_server->set_cluster_protocol(CEPH_OSD_PROTOCOL);
 
@@ -479,16 +497,6 @@ int main(int argc, const char **argv)
   boost::scoped_ptr<Throttle> client_byte_throttler(
     new Throttle(g_ceph_context, "osd_client_bytes",
 		 g_conf->osd_client_message_size_cap));
-  boost::scoped_ptr<Throttle> client_msg_throttler(
-    new Throttle(g_ceph_context, "osd_client_messages",
-		 g_conf->osd_client_message_cap));
-
-  uint64_t supported =
-    CEPH_FEATURE_UID | 
-    CEPH_FEATURE_NOSRCADDR |
-    CEPH_FEATURE_PGID64 |
-    CEPH_FEATURE_MSG_AUTH |
-    CEPH_FEATURE_OSD_ERASURE_CODES;
 
   // All feature bits 0 - 34 should be present from dumpling v0.67 forward
   uint64_t osd_required =
@@ -496,41 +504,40 @@ int main(int argc, const char **argv)
     CEPH_FEATURE_PGID64 |
     CEPH_FEATURE_OSDENC;
 
-  ms_public->set_default_policy(Messenger::Policy::stateless_server(supported, 0));
+  ms_public->set_default_policy(Messenger::Policy::stateless_server(0));
   ms_public->set_policy_throttlers(entity_name_t::TYPE_CLIENT,
 				   client_byte_throttler.get(),
-				   client_msg_throttler.get());
+				   nullptr);
   ms_public->set_policy(entity_name_t::TYPE_MON,
-                               Messenger::Policy::lossy_client(supported,
-							       CEPH_FEATURE_UID |
+                               Messenger::Policy::lossy_client(CEPH_FEATURE_UID |
 							       CEPH_FEATURE_PGID64 |
 							       CEPH_FEATURE_OSDENC));
   ms_public->set_policy(entity_name_t::TYPE_MGR,
-                               Messenger::Policy::lossy_client(supported,
-							       CEPH_FEATURE_UID |
+                               Messenger::Policy::lossy_client(CEPH_FEATURE_UID |
 							       CEPH_FEATURE_PGID64 |
 							       CEPH_FEATURE_OSDENC));
 
   //try to poison pill any OSD connections on the wrong address
   ms_public->set_policy(entity_name_t::TYPE_OSD,
-			Messenger::Policy::stateless_server(0,0));
+			Messenger::Policy::stateless_server(0));
 
-  ms_cluster->set_default_policy(Messenger::Policy::stateless_server(0, 0));
-  ms_cluster->set_policy(entity_name_t::TYPE_MON, Messenger::Policy::lossy_client(0,0));
+  ms_cluster->set_default_policy(Messenger::Policy::stateless_server(0));
+  ms_cluster->set_policy(entity_name_t::TYPE_MON, Messenger::Policy::lossy_client(0));
   ms_cluster->set_policy(entity_name_t::TYPE_OSD,
-			 Messenger::Policy::lossless_peer(supported,
-							  osd_required));
+			 Messenger::Policy::lossless_peer(osd_required));
   ms_cluster->set_policy(entity_name_t::TYPE_CLIENT,
-			 Messenger::Policy::stateless_server(0, 0));
+			 Messenger::Policy::stateless_server(0));
 
-  ms_hbclient->set_policy(entity_name_t::TYPE_OSD,
-			  Messenger::Policy::lossy_client(0, 0));
+  ms_hb_front_client->set_policy(entity_name_t::TYPE_OSD,
+			  Messenger::Policy::lossy_client(0));
+  ms_hb_back_client->set_policy(entity_name_t::TYPE_OSD,
+			  Messenger::Policy::lossy_client(0));
   ms_hb_back_server->set_policy(entity_name_t::TYPE_OSD,
-				Messenger::Policy::stateless_server(0, 0));
+				Messenger::Policy::stateless_server(0));
   ms_hb_front_server->set_policy(entity_name_t::TYPE_OSD,
-				 Messenger::Policy::stateless_server(0, 0));
+				 Messenger::Policy::stateless_server(0));
 
-  ms_objecter->set_default_policy(Messenger::Policy::lossy_client(0, CEPH_FEATURE_OSDREPLYMUX));
+  ms_objecter->set_default_policy(Messenger::Policy::lossy_client(CEPH_FEATURE_OSDREPLYMUX));
 
   r = ms_public->bind(g_conf->public_addr);
   if (r < 0)
@@ -540,7 +547,8 @@ int main(int argc, const char **argv)
     exit(1);
 
   if (g_conf->osd_heartbeat_use_min_delay_socket) {
-    ms_hbclient->set_socket_priority(SOCKET_PRIORITY_MIN_DELAY);
+    ms_hb_front_client->set_socket_priority(SOCKET_PRIORITY_MIN_DELAY);
+    ms_hb_back_client->set_socket_priority(SOCKET_PRIORITY_MIN_DELAY);
     ms_hb_back_server->set_socket_priority(SOCKET_PRIORITY_MIN_DELAY);
     ms_hb_front_server->set_socket_priority(SOCKET_PRIORITY_MIN_DELAY);
   }
@@ -555,12 +563,18 @@ int main(int argc, const char **argv)
   r = ms_hb_back_server->bind(hb_back_addr);
   if (r < 0)
     exit(1);
+  r = ms_hb_back_client->client_bind(hb_back_addr);
+  if (r < 0)
+    exit(1);
 
   // hb front should bind to same ip as public_addr
   entity_addr_t hb_front_addr = g_conf->public_addr;
   if (hb_front_addr.is_ip())
     hb_front_addr.set_port(0);
   r = ms_hb_front_server->bind(hb_front_addr);
+  if (r < 0)
+    exit(1);
+  r = ms_hb_front_client->client_bind(hb_front_addr);
   if (r < 0)
     exit(1);
 
@@ -570,6 +584,9 @@ int main(int argc, const char **argv)
 
   TracepointProvider::initialize<osd_tracepoint_traits>(g_ceph_context);
   TracepointProvider::initialize<os_tracepoint_traits>(g_ceph_context);
+#ifdef WITH_OSD_INSTRUMENT_FUNCTIONS
+  TracepointProvider::initialize<cyg_profile_traits>(g_ceph_context);
+#endif
 
   MonClient mc(g_ceph_context);
   if (mc.build_initial_monmap() < 0)
@@ -586,7 +603,8 @@ int main(int argc, const char **argv)
                 whoami,
                 ms_cluster,
                 ms_public,
-                ms_hbclient,
+                ms_hb_front_client,
+                ms_hb_back_client,
                 ms_hb_front_server,
                 ms_hb_back_server,
                 ms_objecter,
@@ -602,7 +620,8 @@ int main(int argc, const char **argv)
   }
 
   ms_public->start();
-  ms_hbclient->start();
+  ms_hb_front_client->start();
+  ms_hb_back_client->start();
   ms_hb_front_server->start();
   ms_hb_back_server->start();
   ms_cluster->start();
@@ -632,7 +651,8 @@ int main(int argc, const char **argv)
     kill(getpid(), SIGTERM);
 
   ms_public->wait();
-  ms_hbclient->wait();
+  ms_hb_front_client->wait();
+  ms_hb_back_client->wait();
   ms_hb_front_server->wait();
   ms_hb_back_server->wait();
   ms_cluster->wait();
@@ -646,14 +666,14 @@ int main(int argc, const char **argv)
   // done
   delete osd;
   delete ms_public;
-  delete ms_hbclient;
+  delete ms_hb_front_client;
+  delete ms_hb_back_client;
   delete ms_hb_front_server;
   delete ms_hb_back_server;
   delete ms_cluster;
   delete ms_objecter;
 
   client_byte_throttler.reset();
-  client_msg_throttler.reset();
 
   // cd on exit, so that gmon.out (if any) goes into a separate directory for each node.
   char s[20];

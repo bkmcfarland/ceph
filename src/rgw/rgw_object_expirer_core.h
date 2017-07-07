@@ -4,10 +4,11 @@
 #ifndef CEPH_OBJEXP_H
 #define CEPH_OBJEXP_H
 
-#include <errno.h>
-#include <iostream>
-#include <sstream>
+#include <atomic>
 #include <string>
+#include <cerrno>
+#include <sstream>
+#include <iostream>
 
 #include "auth/Crypto.h"
 
@@ -60,12 +61,12 @@ protected:
         lock("OEWorker") {
     }
 
-    void *entry();
+    void *entry() override;
     void stop();
   };
 
   OEWorker *worker;
-  atomic_t down_flag;
+  std::atomic<bool> down_flag = { false };
 
 public:
   explicit RGWObjectExpirer(RGWRados *_store)

@@ -13,28 +13,20 @@
  */
 
 #include "Cond.h"
-#include "Mutex.h"
-#include "Thread.h"
 #include "Timer.h"
 
-#include "common/config.h"
-#include "include/Context.h"
 
 #define dout_subsys ceph_subsys_timer
 #undef dout_prefix
 #define dout_prefix *_dout << "timer(" << this << ")."
 
-#include <sstream>
-#include <signal.h>
-#include <sys/time.h>
-#include <math.h>
 
 
 class SafeTimerThread : public Thread {
   SafeTimer *parent;
 public:
   explicit SafeTimerThread(SafeTimer *s) : parent(s) {}
-  void *entry() {
+  void *entry() override {
     parent->timer_thread();
     return NULL;
   }
@@ -134,8 +126,11 @@ void SafeTimer::add_event_after(double seconds, Context *callback)
 void SafeTimer::add_event_at(utime_t when, Context *callback)
 {
   assert(lock.is_locked());
-  ldout(cct,10) << "add_event_at " << when << " -> " << callback << dendl;
-
+  ldout(cct,10) << __func__ << " " << when << " -> " << callback << dendl;
+  if (stopping) {
+    ldout(cct,5) << __func__ << " already shutdown, event not added" << dendl;
+    delete callback;
+  }
   scheduled_map_t::value_type s_val(when, callback);
   scheduled_map_t::iterator i = schedule.insert(s_val);
 

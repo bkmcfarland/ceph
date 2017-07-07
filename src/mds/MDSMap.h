@@ -25,6 +25,7 @@
 #include <set>
 #include <map>
 #include <string>
+#include <algorithm>
 
 #include "common/config.h"
 
@@ -178,7 +179,7 @@ protected:
   __u32 session_autoclose;
   uint64_t max_file_size;
 
-  std::set<int64_t> data_pools;  // file data pools available to clients (via an ioctl).  first is the default.
+  std::vector<int64_t> data_pools;  // file data pools available to clients (via an ioctl).  first is the default.
   int64_t cas_pool;            // where CAS objects go
   int64_t metadata_pool;       // where fs metadata objects go
   
@@ -193,6 +194,7 @@ protected:
    */
 
   mds_rank_t max_mds; /* The maximum number of active MDSes. Also, the maximum rank. */
+  mds_rank_t standby_count_wanted;
   string balancer;    /* The name/version of the mantle balancer (i.e. the rados obj name) */
 
   std::set<mds_rank_t> in;              // currently defined cluster
@@ -219,7 +221,7 @@ public:
 public:
   MDSMap() 
     : epoch(0), enabled(false), fs_name(MDS_FS_NAME_DEFAULT),
-      flags(0), last_failure(0),
+      flags(CEPH_MDSMAP_DEFAULTS), last_failure(0),
       last_failure_osd_epoch(0),
       tableserver(0), root(0),
       session_timeout(0),
@@ -228,6 +230,7 @@ public:
       cas_pool(-1),
       metadata_pool(-1),
       max_mds(0),
+      standby_count_wanted(-1),
       ever_allowed_features(0),
       explicitly_allowed_features(0),
       inline_data_enabled(false),
@@ -290,17 +293,28 @@ public:
   mds_rank_t get_max_mds() const { return max_mds; }
   void set_max_mds(mds_rank_t m) { max_mds = m; }
 
+  mds_rank_t get_standby_count_wanted(mds_rank_t standby_daemon_count) const {
+    assert(standby_daemon_count >= 0);
+    std::set<mds_rank_t> s;
+    get_standby_replay_mds_set(s);
+    mds_rank_t standbys_avail = (mds_rank_t)s.size()+standby_daemon_count;
+    mds_rank_t wanted = std::max(0, standby_count_wanted);
+    return wanted > standbys_avail ? wanted - standbys_avail : 0;
+  }
+  void set_standby_count_wanted(mds_rank_t n) { standby_count_wanted = n; }
+  bool check_health(mds_rank_t standby_daemon_count);
+
   const std::string get_balancer() const { return balancer; }
   void set_balancer(std::string val) { balancer.assign(val); }
 
   mds_rank_t get_tableserver() const { return tableserver; }
   mds_rank_t get_root() const { return root; }
 
-  const std::set<int64_t> &get_data_pools() const { return data_pools; }
+  const std::vector<int64_t> &get_data_pools() const { return data_pools; }
   int64_t get_first_data_pool() const { return *data_pools.begin(); }
   int64_t get_metadata_pool() const { return metadata_pool; }
   bool is_data_pool(int64_t poolid) const {
-    return data_pools.count(poolid);
+    return std::binary_search(data_pools.begin(), data_pools.end(), poolid);
   }
 
   bool pool_in_use(int64_t poolid) const {
@@ -333,6 +347,10 @@ public:
   unsigned get_num_up_mds() const {
     return up.size();
   }
+  mds_rank_t get_last_in_mds() const {
+    auto p = in.rbegin();
+    return p == in.rend() ? MDS_RANK_NONE : *p;
+  }
   int get_num_failed_mds() const {
     return failed.size();
   }
@@ -347,10 +365,10 @@ public:
 
   // data pools
   void add_data_pool(int64_t poolid) {
-    data_pools.insert(poolid);
+    data_pools.push_back(poolid);
   }
   int remove_data_pool(int64_t poolid) {
-    std::set<int64_t>::iterator p = data_pools.find(poolid);
+    std::vector<int64_t>::iterator p = std::find(data_pools.begin(), data_pools.end(), poolid);
     if (p == data_pools.end())
       return -ENOENT;
     data_pools.erase(p);
@@ -369,6 +387,9 @@ public:
   }
   void get_active_mds_set(std::set<mds_rank_t>& s) const {
     get_mds_set(s, MDSMap::STATE_ACTIVE);
+  }
+  void get_standby_replay_mds_set(std::set<mds_rank_t>& s) const {
+    get_mds_set(s, MDSMap::STATE_STANDBY_REPLAY);
   }
   void get_failed_mds_set(std::set<mds_rank_t>& s) const {
     s = failed;
@@ -414,11 +435,11 @@ public:
   }
   void get_recovery_mds_set(std::set<mds_rank_t>& s) const {
     s = failed;
-    for (std::map<mds_gid_t, mds_info_t>::const_iterator p = mds_info.begin();
-	 p != mds_info.end();
-	 ++p)
-      if (p->second.state >= STATE_REPLAY && p->second.state <= STATE_STOPPING)
-	s.insert(p->second.rank);
+    for (const auto& p : damaged)
+      s.insert(p);
+    for (const auto& p : mds_info)
+      if (p.second.state >= STATE_REPLAY && p.second.state <= STATE_STOPPING)
+	s.insert(p.second.rank);
   }
 
   void
@@ -556,7 +577,7 @@ public:
     return
       get_num_mds(STATE_RESOLVE) > 0 &&
       get_num_mds(STATE_REPLAY) == 0 &&
-      failed.empty();
+      failed.empty() && damaged.empty();
   }
   bool is_rejoining() const {
     // nodes are rejoining cache state
@@ -565,7 +586,7 @@ public:
       get_num_mds(STATE_REPLAY) == 0 &&
       get_num_mds(STATE_RECONNECT) == 0 &&
       get_num_mds(STATE_RESOLVE) == 0 &&
-      failed.empty();
+      failed.empty() && damaged.empty();
   }
   bool is_stopped() const {
     return up.empty();

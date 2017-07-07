@@ -58,7 +58,7 @@ a number of things:
   For example, when you run multiple clusters in a `federated architecture`_, 
   the cluster name (e.g., ``us-west``, ``us-east``) identifies the cluster for
   the current CLI session. **Note:** To identify the cluster name on the 
-  command line interface, specify the a Ceph configuration file with the 
+  command line interface, specify the Ceph configuration file with the 
   cluster name (e.g., ``ceph.conf``, ``us-west.conf``, ``us-east.conf``, etc.).
   Also see CLI usage (``ceph --cluster {cluster-name}``).
   
@@ -150,9 +150,9 @@ The procedure is as follows:
 
 	mon host = 192.168.0.1
 
-   **Note:** You may use IPv6 addresses too, but you must set ``ms bind ipv6`` 
-   to ``true``. See `Network Configuration Reference`_ for details about 
-   network configuration.
+   **Note:** You may use IPv6 addresses instead of IPv4 addresses, but
+   you must set ``ms bind ipv6`` to ``true``. See `Network Configuration
+   Reference`_ for details about network configuration.
 
 #. Create a keyring for your cluster and generate a monitor secret key. ::
 
@@ -290,6 +290,12 @@ The procedure is as follows:
    **Note:** Once you add OSDs and start them, the placement group health errors
    should disappear. See the next section for details.
 
+Manager daemon configuration
+============================
+
+On each node where you run a ceph-mon daemon, you should also set up a ceph-mgr daemon.
+
+See `../mgr/administrator`_
 
 Adding OSDs
 ===========
@@ -317,7 +323,7 @@ on  ``node2`` and ``node3``:
 #. Prepare the OSD. ::
 
 	ssh {node-name}
-	sudo ceph-disk prepare --cluster {cluster-name} --cluster-uuid {uuid} --fs-type {ext4|xfs|btrfs} {data-path} [{journal-path}]
+	sudo ceph-disk prepare --cluster {cluster-name} --cluster-uuid {uuid} {data-path} [{journal-path}]
 
    For example::
 

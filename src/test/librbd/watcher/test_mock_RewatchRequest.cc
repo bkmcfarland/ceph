@@ -1,4 +1,4 @@
-// -*- mode:C; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
 // vim: ts=8 sw=2 smarttab
 
 #include "test/librbd/test_mock_fixture.h"
@@ -57,11 +57,11 @@ struct TestMockWatcherRewatchRequest : public TestMockFixture {
   }
 
   struct WatchCtx : public librados::WatchCtx2 {
-    virtual void handle_notify(uint64_t, uint64_t, uint64_t,
-                               ceph::bufferlist&) {
+    void handle_notify(uint64_t, uint64_t, uint64_t,
+                               ceph::bufferlist&) override {
       assert(false);
     }
-    virtual void handle_error(uint64_t, int) {
+    void handle_error(uint64_t, int) override {
       assert(false);
     }
   };

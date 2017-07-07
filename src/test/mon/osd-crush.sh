@@ -27,7 +27,7 @@ function run() {
     CEPH_ARGS+="--fsid=$(uuidgen) --auth-supported=none "
     CEPH_ARGS+="--mon-host=$CEPH_MON "
 
-    local funcs=${@:-$(set | sed -n -e 's/^\(TEST_[0-9a-z_]*\) .*/\1/p')}
+    local funcs=${@:-$(set | ${SED} -n -e 's/^\(TEST_[0-9a-z_]*\) .*/\1/p')}
     for func in $funcs ; do
         setup $dir || return 1
         $func $dir || return 1
@@ -40,7 +40,7 @@ function TEST_crush_rule_create_simple() {
 
     run_mon $dir a || return 1
 
-    ceph --format xml osd crush rule dump replicated_ruleset | \
+    ceph --format xml osd crush rule dump replicated_rule | \
         egrep '<op>take</op><item>[^<]+</item><item_name>default</item_name>' | \
         grep '<op>choose_firstn</op><num>0</num><type>osd</type>' || return 1
     local ruleset=ruleset0
@@ -63,11 +63,10 @@ function TEST_crush_rule_dump() {
 
     local ruleset=ruleset1
     ceph osd crush rule create-erasure $ruleset || return 1
-    local expected
-    expected="<rule_name>$ruleset</rule_name>"
-    ceph --format xml osd crush rule dump $ruleset | grep $expected || return 1
-    expected='"rule_name": "'$ruleset'"'
-    ceph osd crush rule dump | grep "$expected" || return 1
+    test $(ceph --format json osd crush rule dump $ruleset | \
+           jq ".rule_name == \"$ruleset\"") == true || return 1
+    test $(ceph --format json osd crush rule dump | \
+           jq "map(select(.rule_name == \"$ruleset\")) | length == 1") == true || return 1
     ! ceph osd crush rule dump non_existent_ruleset || return 1
     ceph osd crush rule rm $ruleset || return 1
 }
@@ -146,9 +145,9 @@ function generate_manipulated_rules() {
     ceph osd getcrushmap -o $dir/original_map
     crushtool -d $dir/original_map -o $dir/decoded_original_map
     #manipulate the rulesets , to make the rule_id != ruleset_id
-    sed -i 's/ruleset 0/ruleset 3/' $dir/decoded_original_map
-    sed -i 's/ruleset 2/ruleset 0/' $dir/decoded_original_map
-    sed -i 's/ruleset 1/ruleset 2/' $dir/decoded_original_map
+    ${SED} -i 's/ruleset 0/ruleset 3/' $dir/decoded_original_map
+    ${SED} -i 's/ruleset 2/ruleset 0/' $dir/decoded_original_map
+    ${SED} -i 's/ruleset 1/ruleset 2/' $dir/decoded_original_map
 
     crushtool -c $dir/decoded_original_map -o $dir/new_map
     ceph osd setcrushmap -i $dir/new_map
@@ -210,8 +209,10 @@ function TEST_crush_rename_bucket() {
     run_mon $dir a || return 1
 
     ceph osd crush add-bucket host1 host
+    ceph osd tree
     ! ceph osd tree | grep host2 || return 1
     ceph osd crush rename-bucket host1 host2 || return 1
+    ceph osd tree
     ceph osd tree | grep host2 || return 1
     ceph osd crush rename-bucket host1 host2 || return 1 # idempotency
     ceph osd crush rename-bucket nonexistent something 2>&1 | grep "Error ENOENT" || return 1
@@ -253,6 +254,8 @@ function TEST_crush_repair_faulty_crushmap() {
     run_mon $dir b --public-addr $MONB || return 1
     run_mon $dir c --public-addr $MONC || return 1
 
+    ceph osd pool create rbd 8
+
     local empty_map=$dir/empty_map
     :> $empty_map.txt
     crushtool -c $empty_map.txt -o $empty_map.map || return 1
@@ -273,15 +276,15 @@ function TEST_crush_repair_faulty_crushmap() {
     # should be an empty crush map without any buckets
     success=false
     for delay in 1 2 4 8 16 32 64 128 256 ; do
-        if ! test $(ceph osd crush dump --format=xml | \
-                           $XMLSTARLET sel -t -m "//buckets/bucket" -v .) ; then
+        if test $(ceph osd crush dump --format=json | \
+                  jq '.buckets | length == 0') == true ; then
             success=true
             break
         fi
         sleep $delay
     done
     if ! $success ; then
-        ceph osd crush dump --format=xml
+        ceph osd crush dump --format=json-pretty
         return 1
     fi
     # bring them down, the "ceph" commands will try to hunt for other monitor in
@@ -294,8 +297,8 @@ function TEST_crush_repair_faulty_crushmap() {
     run_mon $dir b --public-addr $MONB || return 1
     run_mon $dir c --public-addr $MONC || return 1
     # the buckets are back
-    test $(ceph osd crush dump --format=xml | \
-           $XMLSTARLET sel -t -m "//buckets/bucket" -v .) || return 1
+    test $(ceph osd crush dump --format=json | \
+           jq '.buckets | length > 0') == true || return 1
     CEPH_ARGS=$CEPH_ARGS_orig
 }
 

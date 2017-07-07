@@ -110,7 +110,7 @@ struct Trimmer : public ObjectModDesc::Visitor {
     PGBackend *pg,
     ObjectStore::Transaction *t)
     : soid(soid), pg(pg), t(t) {}
-  void rmobject(version_t old_version) {
+  void rmobject(version_t old_version) override {
     pg->trim_rollback_object(
       soid,
       old_version,
@@ -174,7 +174,7 @@ void PGBackend::on_change_cleanup(ObjectStore::Transaction *t)
 {
   dout(10) << __func__ << dendl;
   // clear temp
-  for (set<hobject_t, hobject_t::BitwiseComparator>::iterator i = temp_contents.begin();
+  for (set<hobject_t>::iterator i = temp_contents.begin();
        i != temp_contents.end();
        ++i) {
     dout(10) << __func__ << ": Removing oid "
@@ -212,7 +212,6 @@ int PGBackend::objects_list_partial(
       ch,
       _next,
       ghobject_t::get_max(),
-      parent->sort_bitwise(),
       max - ls->size(),
       &objects,
       &_next);
@@ -249,7 +248,6 @@ int PGBackend::objects_list_range(
     ch,
     ghobject_t(start, ghobject_t::NO_GEN, get_parent()->whoami_shard().shard),
     ghobject_t(end, ghobject_t::NO_GEN, get_parent()->whoami_shard().shard),
-    parent->sort_bitwise(),
     INT_MAX,
     &objects,
     NULL);
@@ -410,7 +408,7 @@ PGBackend *PGBackend::build_pg_backend(
     stringstream ss;
     ceph::ErasureCodePluginRegistry::instance().factory(
       profile.find("plugin")->second,
-      cct->_conf->erasure_code_dir,
+      cct->_conf->get_val<std::string>("erasure_code_dir"),
       profile,
       &ec_impl,
       &ss);
@@ -622,11 +620,22 @@ map<pg_shard_t, ScrubMap *>::const_iterator
   eversion_t auth_version;
   bufferlist auth_bl;
 
-  map<pg_shard_t, ScrubMap *>::const_iterator auth = maps.end();
+  // Create list of shards with primary last so it will be auth copy all
+  // other things being equal.
+  list<pg_shard_t> shards;
   for (map<pg_shard_t, ScrubMap *>::const_iterator j = maps.begin();
        j != maps.end();
        ++j) {
-    map<hobject_t, ScrubMap::object, hobject_t::BitwiseComparator>::iterator i =
+    if (j->first == get_parent()->whoami_shard())
+      continue;
+    shards.push_back(j->first);
+  }
+  shards.push_back(get_parent()->whoami_shard());
+
+  map<pg_shard_t, ScrubMap *>::const_iterator auth = maps.end();
+  for (auto &l : shards) {
+    map<pg_shard_t, ScrubMap *>::const_iterator j = maps.find(l);
+    map<hobject_t, ScrubMap::object>::iterator i =
       j->second->objects.find(obj);
     if (i == j->second->objects.end()) {
       continue;
@@ -649,6 +658,8 @@ map<pg_shard_t, ScrubMap *>::const_iterator
     object_info_t oi;
     bufferlist bl;
     map<string, bufferptr>::iterator k;
+    SnapSet ss;
+    bufferlist ss_bl;
 
     if (i->second.stat_error) {
       shard_info.set_stat_error();
@@ -676,6 +687,12 @@ map<pg_shard_t, ScrubMap *>::const_iterator
       goto out;
     }
 
+    if (oi.soid != obj) {
+      shard_info.set_oi_attr_corrupted();
+      error_string += " oi_attr_corrupted";
+      goto out;
+    }
+
     if (auth_version != eversion_t()) {
       if (!object_error.has_object_info_inconsistency() && !(bl == auth_bl)) {
 	object_error.set_object_info_inconsistency();
@@ -687,6 +704,23 @@ map<pg_shard_t, ScrubMap *>::const_iterator
     // XXX: For now we can't pick one shard for repair and another's object info
     if (i->second.read_error || i->second.ec_hash_mismatch || i->second.ec_size_mismatch)
       goto out;
+
+    // We don't set errors here for snapset, but we won't pick an auth copy if the
+    // snapset is missing or won't decode.
+    if (obj.is_head() || obj.is_snapdir()) {
+      k = i->second.attrs.find(SS_ATTR);
+      if (k == i->second.attrs.end()) {
+	goto out;
+      }
+      ss_bl.push_back(k->second);
+      try {
+	bufferlist::iterator bliter = ss_bl.begin();
+	::decode(ss, bliter);
+      } catch (...) {
+	// invalid snapset, probably corrupt
+	goto out;
+      }
+    }
 
     if (auth_version == eversion_t() || oi.version > auth_version ||
         (oi.version == auth_version && dcount(oi) > dcount(*auth_oi))) {
@@ -717,19 +751,19 @@ out:
 void PGBackend::be_compare_scrubmaps(
   const map<pg_shard_t,ScrubMap*> &maps,
   bool repair,
-  map<hobject_t, set<pg_shard_t>, hobject_t::BitwiseComparator> &missing,
-  map<hobject_t, set<pg_shard_t>, hobject_t::BitwiseComparator> &inconsistent,
-  map<hobject_t, list<pg_shard_t>, hobject_t::BitwiseComparator> &authoritative,
-  map<hobject_t, pair<uint32_t,uint32_t>, hobject_t::BitwiseComparator> &missing_digest,
+  map<hobject_t, set<pg_shard_t>> &missing,
+  map<hobject_t, set<pg_shard_t>> &inconsistent,
+  map<hobject_t, list<pg_shard_t>> &authoritative,
+  map<hobject_t, pair<uint32_t,uint32_t>> &missing_digest,
   int &shallow_errors, int &deep_errors,
   Scrub::Store *store,
   const spg_t& pgid,
   const vector<int> &acting,
   ostream &errorstream)
 {
-  map<hobject_t,ScrubMap::object, hobject_t::BitwiseComparator>::const_iterator i;
-  map<pg_shard_t, ScrubMap *, hobject_t::BitwiseComparator>::const_iterator j;
-  set<hobject_t, hobject_t::BitwiseComparator> master_set;
+  map<hobject_t,ScrubMap::object>::const_iterator i;
+  map<pg_shard_t, ScrubMap *>::const_iterator j;
+  set<hobject_t> master_set;
   utime_t now = ceph_clock_now();
 
   // Construct master set
@@ -740,7 +774,7 @@ void PGBackend::be_compare_scrubmaps(
   }
 
   // Check maps against master set and each other
-  for (set<hobject_t, hobject_t::BitwiseComparator>::const_iterator k = master_set.begin();
+  for (set<hobject_t>::const_iterator k = master_set.begin();
        k != master_set.end();
        ++k) {
     object_info_t auth_oi;
@@ -752,6 +786,7 @@ void PGBackend::be_compare_scrubmaps(
       be_select_auth_object(*k, maps, &auth_oi, shard_map, object_error);
 
     list<pg_shard_t> auth_list;
+    set<pg_shard_t> object_errors;
     if (auth == maps.end()) {
       object_error.set_version(0);
       object_error.set_auth_missing(*k, maps, shard_map, shallow_errors, deep_errors);
@@ -795,6 +830,10 @@ void PGBackend::be_compare_scrubmaps(
 	  if (found)
 	    errorstream << pgid << " shard " << j->first << ": soid " << *k
 		      << " " << ss.str() << "\n";
+	} else if (found) {
+	  // Track possible shard to use as authoritative, if needed
+	  // There are errors, without identifying the shard
+	  object_errors.insert(j->first);
 	} else {
 	  // XXX: The auth shard might get here that we don't know
 	  // that it has the "correct" data.
@@ -812,10 +851,25 @@ void PGBackend::be_compare_scrubmaps(
     }
 
     if (auth_list.empty()) {
-      errorstream << pgid.pgid << " soid " << *k
+      if (object_errors.empty()) {
+        errorstream << pgid.pgid << " soid " << *k
 		  << ": failed to pick suitable auth object\n";
-      goto out;
+        goto out;
+      }
+      // Object errors exist and nothing in auth_list
+      // Prefer the auth shard otherwise take first from list.
+      pg_shard_t shard;
+      if (object_errors.count(auth->first)) {
+	shard = auth->first;
+      } else {
+	shard = *(object_errors.begin());
+      }
+      auth_list.push_back(shard);
+      object_errors.erase(shard);
     }
+    // At this point auth_list is populated, so we add the object errors shards
+    // as inconsistent.
+    cur_inconsistent.insert(object_errors.begin(), object_errors.end());
     if (!cur_missing.empty()) {
       missing[*k] = cur_missing;
     }

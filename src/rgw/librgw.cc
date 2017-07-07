@@ -11,8 +11,10 @@
  * Foundation.  See file COPYING.
  *
  */
+#include "include/compat.h"
 #include <sys/types.h>
 #include <string.h>
+#include <chrono>
 
 #include "include/types.h"
 #include "include/rados/librgw.h"
@@ -69,7 +71,7 @@ namespace rgw {
   class C_InitTimeout : public Context {
   public:
     C_InitTimeout() {}
-    void finish(int r) {
+    void finish(int r) override {
       derr << "Initialization timeout, failed to initialize" << dendl;
       exit(1);
     }
@@ -79,6 +81,8 @@ namespace rgw {
   {
     m_tp.drain(&req_wq);
   }
+
+#define MIN_EXPIRE_S 120
 
   void RGWLibProcess::run()
   {
@@ -92,6 +96,14 @@ namespace rgw {
     /* gc loop */
     while (! shutdown) {
       lsubdout(cct, rgw, 5) << "RGWLibProcess GC" << dendl;
+
+      /* dirent invalidate timeout--basically, the upper-bound on
+       * inconsistency with the S3 namespace */
+      auto expire_s = cct->_conf->rgw_nfs_namespace_expire_secs;
+
+      /* delay between gc cycles */
+      auto delay_s = std::max(1, std::min(MIN_EXPIRE_S, expire_s/2));
+
       unique_lock uniq(mtx);
     restart:
       int cur_gen = gen;
@@ -106,7 +118,7 @@ namespace rgw {
 	  goto restart; /* invalidated */
       }
       uniq.unlock();
-      std::this_thread::sleep_for(std::chrono::seconds(120));
+      std::this_thread::sleep_for(std::chrono::seconds(delay_s));
     }
   }
 
@@ -239,8 +251,8 @@ namespace rgw {
 
     /* FIXME: remove this after switching all handlers to the new authentication
      * infrastructure. */
-    if (! s->auth_identity) {
-      s->auth_identity = rgw_auth_transform_old_authinfo(s);
+    if (! s->auth.identity) {
+      s->auth.identity = rgw::auth::transform_old_authinfo(s);
     }
 
     req->log(s, "reading op permissions");
@@ -269,7 +281,7 @@ namespace rgw {
     if (ret < 0) {
       if (s->system_request) {
 	dout(2) << "overriding permissions due to system operation" << dendl;
-      } else if (s->auth_identity->is_admin_of(s->user->user_id)) {
+      } else if (s->auth.identity->is_admin_of(s->user->user_id)) {
 	dout(2) << "overriding permissions due to admin operation" << dendl;
       } else {
 	abort_req(s, op, ret);
@@ -354,8 +366,8 @@ namespace rgw {
 
     /* FIXME: remove this after switching all handlers to the new authentication
      * infrastructure. */
-    if (! s->auth_identity) {
-      s->auth_identity = rgw_auth_transform_old_authinfo(s);
+    if (! s->auth.identity) {
+      s->auth.identity = rgw::auth::transform_old_authinfo(s);
     }
 
     req->log(s, "reading op permissions");
@@ -384,7 +396,7 @@ namespace rgw {
     if (ret < 0) {
       if (s->system_request) {
 	dout(2) << "overriding permissions due to system operation" << dendl;
-      } else if (s->auth_identity->is_admin_of(s->user->user_id)) {
+      } else if (s->auth.identity->is_admin_of(s->user->user_id)) {
 	dout(2) << "overriding permissions due to admin operation" << dendl;
       } else {
 	abort_req(s, op, ret);
@@ -470,7 +482,8 @@ namespace rgw {
 					 g_conf->rgw_enable_gc_threads,
 					 g_conf->rgw_enable_lc_threads,
 					 g_conf->rgw_enable_quota_threads,
-					 g_conf->rgw_run_sync_thread);
+					 g_conf->rgw_run_sync_thread,
+					 g_conf->rgw_dynamic_resharding);
 
     if (!store) {
       mutex.Lock();
@@ -561,8 +574,6 @@ namespace rgw {
     dout(1) << "final shutdown" << dendl;
     cct.reset();
 
-    ceph::crypto::shutdown();
-
     return 0;
   } /* RGWLib::stop() */
 
@@ -638,7 +649,18 @@ int librgw_create(librgw_t* rgw, int argc, char **argv)
     std::lock_guard<std::mutex> lg(librgw_mtx);
     if (! g_ceph_context) {
       vector<const char*> args;
+      std::vector<std::string> spl_args;
+      // last non-0 argument will be split and consumed
+      if (argc > 1) {
+	const std::string spl_arg{argv[(--argc)]};
+	get_str_vec(spl_arg, " \t", spl_args);
+      }
       argv_to_vec(argc, const_cast<const char**>(argv), args);
+      // append split args, if any
+      for (const auto& elt : spl_args) {
+	args.push_back(elt.c_str());
+      }
+      env_to_vec(args);
       rc = rgwlib.init(args);
     }
   }

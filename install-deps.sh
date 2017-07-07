@@ -22,6 +22,7 @@ export LC_ALL=C # the following is vulnerable to i18n
 if [ x`uname`x = xFreeBSDx ]; then
     $SUDO pkg install -yq \
         devel/git \
+        devel/gperf \
         devel/gmake \
         devel/cmake \
         devel/yasm \
@@ -29,7 +30,6 @@ if [ x`uname`x = xFreeBSDx ]; then
         devel/boost-python-libs \
         devel/valgrind \
         devel/pkgconf \
-        devel/libatomic_ops \
         devel/libedit \
         devel/libtool \
         devel/google-perftools \
@@ -44,17 +44,24 @@ if [ x`uname`x = xFreeBSDx ]; then
         misc/e2fsprogs-libuuid \
         misc/getopt \
         textproc/expat2 \
+        textproc/gsed \
         textproc/libxml2 \
         textproc/xmlstarlet \
 	textproc/jq \
+	textproc/sphinx \
         emulators/fuse \
         java/junit \
         lang/python27 \
+	devel/py-pip \
         devel/py-argparse \
         devel/py-nose \
         www/py-flask \
         www/fcgi \
         sysutils/flock \
+        sysutils/fusefs-libs \
+
+	# Now use pip to install some extra python modules
+	pip install pecan
 
     exit
 else
@@ -87,7 +94,7 @@ else
 	$SUDO env DEBIAN_FRONTEND=noninteractive apt-get -y remove ceph-build-deps
 	if [ -n "$backports" ] ; then rm $control; fi
         ;;
-    centos|fedora|rhel)
+    centos|fedora|rhel|ol|virtuozzo)
         yumdnf="yum"
         builddepcmd="yum-builddep -y"
         if test "$(echo "$VERSION_ID >= 22" | bc)" -ne 0; then
@@ -102,7 +109,7 @@ else
                     $SUDO $yumdnf install -y yum-utils
                 fi
                 ;;
-            CentOS|RedHatEnterpriseServer)
+            CentOS|RedHatEnterpriseServer|VirtuozzoLinux)
                 $SUDO yum install -y yum-utils
                 MAJOR_VERSION=$(lsb_release -rs | cut -f1 -d.)
                 if test $(lsb_release -si) = RedHatEnterpriseServer ; then
@@ -114,6 +121,9 @@ else
                 $SUDO rpm --import /etc/pki/rpm-gpg/RPM-GPG-KEY-EPEL-$MAJOR_VERSION
                 $SUDO rm -f /etc/yum.repos.d/dl.fedoraproject.org*
                 if test $(lsb_release -si) = CentOS -a $MAJOR_VERSION = 7 ; then
+                    $SUDO yum-config-manager --enable cr
+                fi
+                if test $(lsb_release -si) = VirtuozzoLinux -a $MAJOR_VERSION = 7 ; then
                     $SUDO yum-config-manager --enable cr
                 fi
                 ;;
@@ -128,6 +138,18 @@ else
         sed -e 's/@//g' < ceph.spec.in > $DIR/ceph.spec
         $SUDO zypper --non-interactive install $(rpmspec -q --buildrequires $DIR/ceph.spec) || exit 1
         ;;
+    alpine)
+        # for now we need the testing repo for leveldb
+        TESTREPO="http://nl.alpinelinux.org/alpine/edge/testing"
+        if ! grep -qF "$TESTREPO" /etc/apk/repositories ; then
+            $SUDO echo "$TESTREPO" | sudo tee -a /etc/apk/repositories > /dev/null
+        fi
+        source alpine/APKBUILD.in
+        $SUDO apk --update add abuild build-base ccache $makedepends
+        if id -u build >/dev/null 2>&1 ; then
+           $SUDO addgroup build abuild
+        fi
+        ;;
     *)
         echo "$ID is unknown, dependencies will have to be installed manually."
 	exit 1
@@ -141,7 +163,8 @@ function populate_wheelhouse() {
 
     # although pip comes with virtualenv, having a recent version
     # of pip matters when it comes to using wheel packages
-    pip --timeout 300 $install 'setuptools >= 0.8' 'pip >= 7.0' 'wheel >= 0.24' || return 1
+    # workaround of https://github.com/pypa/setuptools/issues/1042
+    pip --timeout 300 $install 'setuptools >= 0.8,< 36' 'pip >= 7.0' 'wheel >= 0.24' || return 1
     if test $# != 0 ; then
         pip --timeout 300 $install $@ || return 1
     fi

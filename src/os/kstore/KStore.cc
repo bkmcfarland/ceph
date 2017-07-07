@@ -21,7 +21,7 @@
 
 #include "KStore.h"
 #include "osd/osd_types.h"
-#include "kv.h"
+#include "os/kv.h"
 #include "include/compat.h"
 #include "include/stringify.h"
 #include "common/errno.h"
@@ -1169,8 +1169,7 @@ int KStore::read(
   uint64_t offset,
   size_t length,
   bufferlist& bl,
-  uint32_t op_flags,
-  bool allow_eio)
+  uint32_t op_flags)
 {
   dout(15) << __func__ << " " << cid << " " << oid
 	   << " " << offset << "~" << length
@@ -1280,6 +1279,21 @@ int KStore::fiemap(
   bufferlist& bl)
 {
   map<uint64_t, uint64_t> m;
+  int r = fiemap(cid, oid, offset, len, m);
+  if (r >= 0) {
+    ::encode(m, bl);
+  }
+
+  return r;
+}
+
+int KStore::fiemap(
+  const coll_t& cid,
+  const ghobject_t& oid,
+  uint64_t offset,
+  size_t len,
+  map<uint64_t, uint64_t>& destmap)
+{
   CollectionRef c = _get_collection(cid);
   if (!c)
     return -ENOENT;
@@ -1301,12 +1315,11 @@ int KStore::fiemap(
 	   << o->onode.size << dendl;
 
   // FIXME: do something smarter here
-  m[0] = o->onode.size;
+  destmap[0] = o->onode.size;
 
  out:
-  ::encode(m, bl);
   dout(20) << __func__ << " " << offset << "~" << len
-	   << " size = 0 (" << m << ")" << dendl;
+	   << " size = 0 (" << destmap << ")" << dendl;
   return 0;
 }
 
@@ -1388,7 +1401,7 @@ int KStore::collection_empty(const coll_t& cid, bool *empty)
   dout(15) << __func__ << " " << cid << dendl;
   vector<ghobject_t> ls;
   ghobject_t next;
-  int r = collection_list(cid, ghobject_t(), ghobject_t::get_max(), true, 1,
+  int r = collection_list(cid, ghobject_t(), ghobject_t::get_max(), 1,
 			  &ls, &next);
   if (r < 0) {
     derr << __func__ << " collection_list returned: " << cpp_strerror(r)
@@ -1400,20 +1413,30 @@ int KStore::collection_empty(const coll_t& cid, bool *empty)
   return 0;
 }
 
+int KStore::collection_bits(const coll_t& cid)
+{
+  dout(15) << __func__ << " " << cid << dendl;
+  CollectionHandle ch = _get_collection(cid);
+  if (!ch)
+    return -ENOENT;
+  Collection *c = static_cast<Collection*>(ch.get());
+  RWLock::RLocker l(c->lock);
+  dout(10) << __func__ << " " << cid << " = " << c->cnode.bits << dendl;
+  return c->cnode.bits;
+}
+
 int KStore::collection_list(
-  const coll_t& cid, const ghobject_t& start, const ghobject_t& end,
-  bool sort_bitwise, int max,
+  const coll_t& cid, const ghobject_t& start, const ghobject_t& end, int max,
   vector<ghobject_t> *ls, ghobject_t *pnext)
 {
   CollectionHandle c = _get_collection(cid);
   if (!c)
     return -ENOENT;
-  return collection_list(c, start, end, sort_bitwise, max, ls, pnext);
+  return collection_list(c, start, end, max, ls, pnext);
 }
 
 int KStore::collection_list(
-  CollectionHandle &c_, const ghobject_t& start, const ghobject_t& end,
-  bool sort_bitwise, int max,
+  CollectionHandle &c_, const ghobject_t& start, const ghobject_t& end, int max,
   vector<ghobject_t> *ls, ghobject_t *pnext)
 
 {
@@ -1423,7 +1446,7 @@ int KStore::collection_list(
   int r;
   {
     RWLock::RLocker l(c->lock);
-    r = _collection_list(c, start, end, sort_bitwise, max, ls, pnext);
+    r = _collection_list(c, start, end, max, ls, pnext);
   }
 
   dout(10) << __func__ << " " << c->cid
@@ -1434,13 +1457,9 @@ int KStore::collection_list(
 }
 
 int KStore::_collection_list(
-  Collection* c, const ghobject_t& start, const ghobject_t& end,
-  bool sort_bitwise, int max,
+  Collection* c, const ghobject_t& start, const ghobject_t& end, int max,
   vector<ghobject_t> *ls, ghobject_t *pnext)
 {
-  if (!sort_bitwise)
-    return -EOPNOTSUPP;
-
   int r = 0;
   KeyValueDB::Iterator it;
   string temp_start_key, temp_end_key;
@@ -2505,7 +2524,7 @@ void KStore::_txc_add_transaction(TransContext *txc, Transaction *t)
 	if (r == -ENOSPC)
 	  // For now, if we hit _any_ ENOSPC, crash, before we do any damage
 	  // by partially applying transactions.
-	  msg = "ENOSPC handling not implemented";
+	  msg = "ENOSPC from key value store, misconfigured cluster";
 
 	if (r == -ENOTEMPTY) {
 	  msg = "ENOTEMPTY suggests garbage data in osd data dir";
@@ -3192,6 +3211,8 @@ int KStore::_clone_range(TransContext *txc,
     goto out;
 
   r = _do_write(txc, newo, dstoff, bl.length(), bl, 0);
+  if (r < 0)
+    goto out;
 
   txc->write_onode(newo);
 
@@ -3293,7 +3314,7 @@ int KStore::_remove_collection(TransContext *txc, coll_t cid,
     // Enumerate onodes in db, up to nonexistent_count + 1
     // then check if all of them are marked as non-existent.
     // Bypass the check if returned number is greater than nonexistent_count
-    r = _collection_list(c->get(), ghobject_t(), ghobject_t::get_max(), true,
+    r = _collection_list(c->get(), ghobject_t(), ghobject_t::get_max(),
                          nonexistent_count + 1, &ls, &next);
     if (r >= 0) {
       bool exists = false; //ls.size() > nonexistent_count;

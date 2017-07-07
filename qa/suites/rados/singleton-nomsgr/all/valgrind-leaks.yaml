@@ -1,4 +1,6 @@
-os_type: centos   # xenial valgrind buggy, see http://tracker.ceph.com/issues/18126
+# see http://tracker.ceph.com/issues/20360 and http://tracker.ceph.com/issues/18126
+os_type: centos
+
 overrides:
   install:
     ceph:
@@ -15,7 +17,7 @@ overrides:
       mon: [--tool=memcheck, --leak-check=full, --show-reachable=yes]
       osd: [--tool=memcheck]
 roles:
-- [mon.0, osd.0, osd.1, client.0]
+- [mon.a, mgr.x, osd.0, osd.1, client.0]
 tasks:
 - install:
 - ceph:

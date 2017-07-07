@@ -1,6 +1,6 @@
 # verify #13098 fix
 roles:
-- [mon.a, osd.0, osd.1, osd.2, client.0]
+- [mon.a, mgr.x, osd.0, osd.1, osd.2, client.0]
 overrides:
   ceph:
     log-whitelist:
@@ -24,3 +24,5 @@ tasks:
       - ceph osd pool set-quota ec max_bytes 20480000
       - ceph osd pool set ec-ca target_max_bytes 20480000
       - timeout 30 rados -p ec-ca bench 30 write || true
+      - ceph osd pool set-quota ec-ca max_bytes 0
+      - ceph osd pool set-quota ec max_bytes 0

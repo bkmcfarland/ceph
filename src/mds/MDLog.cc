@@ -33,8 +33,6 @@
 
 #define dout_context g_ceph_context
 #define dout_subsys ceph_subsys_mds
-#undef DOUT_COND
-#define DOUT_COND(cct, l) l<=cct->_conf->debug_mds || l <= cct->_conf->debug_mds_log
 #undef dout_prefix
 #define dout_prefix *_dout << "mds." << mds->get_nodeid() << ".log "
 
@@ -74,7 +72,7 @@ void MDLog::create_logger()
   plb.add_u64(l_mdl_expos, "expos", "Journaler xpire position");
   plb.add_u64(l_mdl_wrpos, "wrpos", "Journaler  write position");
   plb.add_u64(l_mdl_rdpos, "rdpos", "Journaler  read position");
-  plb.add_u64(l_mdl_jlat, "jlat", "Journaler flush latency");
+  plb.add_time_avg(l_mdl_jlat, "jlat", "Journaler flush latency");
 
   plb.add_u64_counter(l_mdl_replayed, "replayed", "Events replayed");
 
@@ -91,9 +89,9 @@ void MDLog::set_write_iohint(unsigned iohint_flags)
 class C_MDL_WriteError : public MDSIOContextBase {
   protected:
   MDLog *mdlog;
-  MDSRank *get_mds() {return mdlog->mds;}
+  MDSRank *get_mds() override {return mdlog->mds;}
 
-  void finish(int r) {
+  void finish(int r) override {
     MDSRank *mds = get_mds();
     // assume journal is reliable, so don't choose action based on
     // g_conf->mds_action_on_write_error.
@@ -157,10 +155,9 @@ void MDLog::create(MDSInternalContextBase *c)
 
   // Instantiate Journaler and start async write to RADOS
   assert(journaler == NULL);
-  journaler = new Journaler(ino, mds->mdsmap->get_metadata_pool(), CEPH_FS_ONDISK_MAGIC, mds->objecter,
-			    logger, l_mdl_jlat,
-			    &mds->timer,
-                            mds->finisher);
+  journaler = new Journaler("mdlog", ino, mds->mdsmap->get_metadata_pool(),
+                            CEPH_FS_ONDISK_MAGIC, mds->objecter, logger,
+                            l_mdl_jlat, mds->finisher);
   assert(journaler->is_readonly());
   journaler->set_write_error_handler(new C_MDL_WriteError(this));
   journaler->set_writeable();
@@ -202,7 +199,7 @@ class C_ReopenComplete : public MDSInternalContext {
   MDSInternalContextBase *on_complete;
 public:
   C_ReopenComplete(MDLog *mdlog_, MDSInternalContextBase *on_complete_) : MDSInternalContext(mdlog_->mds), mdlog(mdlog_), on_complete(on_complete_) {}
-  void finish(int r) {
+  void finish(int r) override {
     mdlog->append();
     on_complete->complete(r);
   }
@@ -281,14 +278,6 @@ void MDLog::_submit_entry(LogEvent *le, MDSLogContextBase *c)
   assert(le == cur_event);
   cur_event = NULL;
 
-  if (!g_conf->mds_log) {
-    // hack: log is disabled.
-    if (c) {
-      mds->finisher->queue(c, 0);
-    }
-    return;
-  }
-
   // let the event register itself in the segment
   assert(!segments.empty());
   LogSegment *ls = segments.rbegin()->second;
@@ -339,10 +328,10 @@ void MDLog::_submit_entry(LogEvent *le, MDSLogContextBase *c)
 class C_MDL_Flushed : public MDSLogContextBase {
 protected:
   MDLog *mdlog;
-  MDSRank *get_mds() {return mdlog->mds;}
+  MDSRank *get_mds() override {return mdlog->mds;}
   MDSInternalContextBase *wrapped;
 
-  void finish(int r) {
+  void finish(int r) override {
     if (wrapped)
       wrapped->complete(r);
   }
@@ -447,12 +436,6 @@ void MDLog::_submit_thread()
 
 void MDLog::wait_for_safe(MDSInternalContextBase *c)
 {
-  if (!g_conf->mds_log) {
-    // hack: bypass.
-    c->complete(0);
-    return;
-  }
-
   submit_mutex.Lock();
 
   bool no_pending = true;
@@ -678,7 +661,7 @@ class C_MaybeExpiredSegment : public MDSInternalContext {
   public:
   C_MaybeExpiredSegment(MDLog *mdl, LogSegment *s, int p) :
     MDSInternalContext(mdl->mds), mdlog(mdl), ls(s), op_prio(p) {}
-  void finish(int res) {
+  void finish(int res) override {
     if (res < 0)
       mdlog->mds->handle_write_error(res);
     mdlog->_maybe_expired(ls, op_prio);
@@ -799,9 +782,11 @@ void MDLog::_trim_expired_segments()
     // this was the oldest segment, adjust expire pos
     if (journaler->get_expire_pos() < ls->end) {
       journaler->set_expire_pos(ls->end);
+      logger->set(l_mdl_expos, ls->end);
+    } else {
+      logger->set(l_mdl_expos, ls->offset);
     }
     
-    logger->set(l_mdl_expos, ls->offset);
     logger->inc(l_mdl_segtrm);
     logger->inc(l_mdl_evtrm, ls->num_events);
     
@@ -864,7 +849,7 @@ void MDLog::replay(MDSInternalContextBase *c)
   // empty?
   if (journaler->get_read_pos() == journaler->get_write_pos()) {
     dout(10) << "replay - journal empty, done." << dendl;
-    mds->mdcache->trim(-1);
+    mds->mdcache->trim();
     if (c) {
       c->complete(0);
     }
@@ -954,8 +939,9 @@ void MDLog::_recovery_thread(MDSInternalContextBase *completion)
     }
     dout(1) << "Erasing journal " << jp.back << dendl;
     C_SaferCond erase_waiter;
-    Journaler back(jp.back, mds->mdsmap->get_metadata_pool(), CEPH_FS_ONDISK_MAGIC,
-        mds->objecter, logger, l_mdl_jlat, &mds->timer, mds->finisher);
+    Journaler back("mdlog", jp.back, mds->mdsmap->get_metadata_pool(),
+        CEPH_FS_ONDISK_MAGIC, mds->objecter, logger, l_mdl_jlat,
+        mds->finisher);
 
     // Read all about this journal (header + extents)
     C_SaferCond recover_wait;
@@ -992,8 +978,9 @@ void MDLog::_recovery_thread(MDSInternalContextBase *completion)
   }
 
   /* Read the header from the front journal */
-  Journaler *front_journal = new Journaler(jp.front, mds->mdsmap->get_metadata_pool(),
-      CEPH_FS_ONDISK_MAGIC, mds->objecter, logger, l_mdl_jlat, &mds->timer, mds->finisher);
+  Journaler *front_journal = new Journaler("mdlog", jp.front,
+      mds->mdsmap->get_metadata_pool(), CEPH_FS_ONDISK_MAGIC, mds->objecter,
+      logger, l_mdl_jlat, mds->finisher);
 
   // Assign to ::journaler so that we can be aborted by ::shutdown while
   // waiting for journaler recovery
@@ -1078,8 +1065,8 @@ void MDLog::_reformat_journal(JournalPointer const &jp_in, Journaler *old_journa
   assert(write_result == 0);
 
   /* Create the new Journaler file */
-  Journaler *new_journal = new Journaler(jp.back, mds->mdsmap->get_metadata_pool(),
-      CEPH_FS_ONDISK_MAGIC, mds->objecter, logger, l_mdl_jlat, &mds->timer, mds->finisher);
+  Journaler *new_journal = new Journaler("mdlog", jp.back,
+      mds->mdsmap->get_metadata_pool(), CEPH_FS_ONDISK_MAGIC, mds->objecter, logger, l_mdl_jlat, mds->finisher);
   dout(4) << "Writing new journal header " << jp.back << dendl;
   file_layout_t new_layout = old_journal->get_layout();
   new_journal->set_writeable();
@@ -1168,9 +1155,9 @@ void MDLog::_reformat_journal(JournalPointer const &jp_in, Journaler *old_journa
       if (le->get_type() == EVENT_SUBTREEMAP
           || le->get_type() == EVENT_SUBTREEMAP_TEST) {
         ESubtreeMap *sle = dynamic_cast<ESubtreeMap*>(le);
+        assert(sle != NULL);
         dout(20) << __func__ << " zeroing expire_pos in subtreemap event at "
           << le_pos << " seq=" << sle->event_seq << dendl;
-        assert(sle != NULL);
         sle->expire_pos = 0;
         modified = true;
       }

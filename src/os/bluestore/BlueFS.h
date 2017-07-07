@@ -22,11 +22,11 @@ enum {
   l_bluefs_gift_bytes,
   l_bluefs_reclaim_bytes,
   l_bluefs_db_total_bytes,
-  l_bluefs_db_free_bytes,
+  l_bluefs_db_used_bytes,
   l_bluefs_wal_total_bytes,
-  l_bluefs_wal_free_bytes,
+  l_bluefs_wal_used_bytes,
   l_bluefs_slow_total_bytes,
-  l_bluefs_slow_free_bytes,
+  l_bluefs_slow_used_bytes,
   l_bluefs_num_files,
   l_bluefs_log_bytes,
   l_bluefs_log_compactions,
@@ -75,7 +75,7 @@ public:
 	num_writers(0),
 	num_reading(0)
       {}
-    ~File() {
+    ~File() override {
       assert(num_readers.load() == 0);
       assert(num_writers.load() == 0);
       assert(num_reading.load() == 0);
@@ -130,7 +130,8 @@ public:
     FileWriter(FileRef f)
       : file(f),
 	pos(0),
-	buffer_appender(buffer.get_page_aligned_appender()) {
+	buffer_appender(buffer.get_page_aligned_appender(
+			  g_conf->bluefs_alloc_size / CEPH_PAGE_SIZE)) {
       ++file->num_writers;
       iocv.fill(nullptr);
     }
@@ -272,7 +273,7 @@ private:
   int _flush(FileWriter *h, bool force);
   int _fsync(FileWriter *h, std::unique_lock<std::mutex>& l);
 
-  void _claim_completed_aios(FileWriter *h, list<FS::aio_t> *ls);
+  void _claim_completed_aios(FileWriter *h, list<aio_t> *ls);
   void wait_for_aio(FileWriter *h);  // safe to call without a lock
 
   int _flush_and_sync_log(std::unique_lock<std::mutex>& l,
@@ -286,6 +287,7 @@ private:
 
   //void _aio_finish(void *priv);
 
+  void _flush_bdev_safely(FileWriter *h);
   void flush_bdev();  // this is safe to call without a lock
 
   int _preallocate(FileRef f, uint64_t off, uint64_t len);
@@ -331,12 +333,14 @@ public:
   int mount();
   void umount();
 
+  void collect_metadata(map<string,string> *pm);
   int fsck();
 
   uint64_t get_fs_usage();
   uint64_t get_total(unsigned id);
   uint64_t get_free(unsigned id);
   void get_usage(vector<pair<uint64_t,uint64_t>> *usage); // [<free,total> ...]
+  void dump_perf_counters(Formatter *f);
 
   /// get current extents that we own for given block device
   int get_block_extents(unsigned id, interval_set<uint64_t> *extents);

@@ -47,6 +47,7 @@
 #include "RadosClient.h"
 
 #include "include/assert.h"
+#include "common/EventTrace.h"
 
 #define dout_subsys ceph_subsys_rados
 #undef dout_prefix
@@ -59,7 +60,7 @@ bool librados::RadosClient::ms_get_authorizer(int dest_type,
   /* monitor authorization is being handled on different layer */
   if (dest_type == CEPH_ENTITY_TYPE_MON)
     return true;
-  *authorizer = monclient.auth->build_authorizer(dest_type);
+  *authorizer = monclient.build_authorizer(dest_type);
   return *authorizer != NULL;
 }
 
@@ -76,8 +77,8 @@ librados::RadosClient::RadosClient(CephContext *cct_)
     lock("librados::RadosClient::lock"),
     timer(cct, lock),
     refcnt(1),
-    log_last_version(0), log_cb(NULL), log_cb_arg(NULL),
-    finisher(cct)
+    log_last_version(0), log_cb(NULL), log_cb2(NULL), log_cb_arg(NULL),
+    finisher(cct, "radosclient", "fn-radosclient")
 {
 }
 
@@ -88,8 +89,18 @@ int64_t librados::RadosClient::lookup_pool(const char *name)
     return r;
   }
 
-  return objecter->with_osdmap(std::mem_fn(&OSDMap::lookup_pg_pool_name),
-			       name);
+  int64_t ret = objecter->with_osdmap(std::mem_fn(&OSDMap::lookup_pg_pool_name),
+                                 name);
+  if (-ENOENT == ret) {
+    // Make sure we have the latest map
+    int r = wait_for_latest_osdmap();
+    if (r < 0)
+      return r;
+    ret = objecter->with_osdmap(std::mem_fn(&OSDMap::lookup_pg_pool_name),
+                                 name);
+  }
+
+  return ret;
 }
 
 bool librados::RadosClient::pool_requires_alignment(int64_t pool_id)
@@ -249,7 +260,7 @@ int librados::RadosClient::connect()
   // require OSDREPLYMUX feature.  this means we will fail to talk to
   // old servers.  this is necessary because otherwise we won't know
   // how to decompose the reply data into its constituent pieces.
-  messenger->set_default_policy(Messenger::Policy::lossy_client(0, CEPH_FEATURE_OSDREPLYMUX));
+  messenger->set_default_policy(Messenger::Policy::lossy_client(CEPH_FEATURE_OSDREPLYMUX));
 
   ldout(cct, 1) << "starting msgr at " << messenger->get_myaddr() << dendl;
 
@@ -340,7 +351,7 @@ void librados::RadosClient::shutdown()
   }
 
   bool need_objecter = false;
-  if (objecter && objecter->initialized.read()) {
+  if (objecter && objecter->initialized) {
     need_objecter = true;
   }
 
@@ -395,7 +406,7 @@ struct C_aio_watch_flush_Complete : public Context {
     c->get();
   }
 
-  virtual void finish(int r) {
+  void finish(int r) override {
     c->lock.Lock();
     c->rval = r;
     c->complete = true;
@@ -436,15 +447,7 @@ int librados::RadosClient::create_ioctx(const char *name, IoCtxImpl **io)
 {
   int64_t poolid = lookup_pool(name);
   if (poolid < 0) {
-    // Make sure we have the latest map
-    int r = wait_for_latest_osdmap();
-    if (r < 0)
-      return r;
-
-    poolid = lookup_pool(name);
-    if (poolid < 0) {
-      return (int)poolid;
-    }
+    return (int)poolid;
   }
 
   *io = new librados::IoCtxImpl(this, objecter, poolid, CEPH_NOSNAP);
@@ -822,10 +825,12 @@ int librados::RadosClient::mgr_command(const vector<string>& cmd,
   Mutex::Locker l(lock);
 
   C_SaferCond cond;
-  mgrclient.start_command(cmd, inbl, outbl, outs, &cond);
+  int r = mgrclient.start_command(cmd, inbl, outbl, outs, &cond);
+  if (r < 0)
+    return r;
 
   lock.Unlock();
-  int r = cond.wait();
+  r = cond.wait();
   lock.Lock();
 
   return r;
@@ -885,10 +890,9 @@ int librados::RadosClient::osd_command(int osd, vector<string>& cmd,
 
   lock.Lock();
   // XXX do anything with tid?
-  int r = objecter->osd_command(osd, cmd, inbl, &tid, poutbl, prs,
-			 new C_SafeCond(&mylock, &cond, &done, &ret));
+  objecter->osd_command(osd, cmd, inbl, &tid, poutbl, prs,
+			new C_SafeCond(&mylock, &cond, &done, &ret));
   lock.Unlock();
-  assert(r == 0);
   mylock.Lock();
   while (!done)
     cond.Wait(mylock);
@@ -906,10 +910,9 @@ int librados::RadosClient::pg_command(pg_t pgid, vector<string>& cmd,
   int ret;
   ceph_tid_t tid;
   lock.Lock();
-  int r = objecter->pg_command(pgid, cmd, inbl, &tid, poutbl, prs,
-		        new C_SafeCond(&mylock, &cond, &done, &ret));
+  objecter->pg_command(pgid, cmd, inbl, &tid, poutbl, prs,
+		       new C_SafeCond(&mylock, &cond, &done, &ret));
   lock.Unlock();
-  assert(r == 0);
   mylock.Lock();
   while (!done)
     cond.Wait(mylock);
@@ -917,7 +920,10 @@ int librados::RadosClient::pg_command(pg_t pgid, vector<string>& cmd,
   return ret;
 }
 
-int librados::RadosClient::monitor_log(const string& level, rados_log_callback_t cb, void *arg)
+int librados::RadosClient::monitor_log(const string& level,
+				       rados_log_callback_t cb,
+				       rados_log_callback2_t cb2,
+				       void *arg)
 {
   Mutex::Locker l(lock);
 
@@ -925,12 +931,14 @@ int librados::RadosClient::monitor_log(const string& level, rados_log_callback_t
     return -ENOTCONN;
   }
 
-  if (cb == NULL) {
+  if (cb == NULL && cb2 == NULL) {
     // stop watch
-    ldout(cct, 10) << __func__ << " removing cb " << (void*)log_cb << dendl;
+    ldout(cct, 10) << __func__ << " removing cb " << (void*)log_cb
+		   << " " << (void*)log_cb2 << dendl;
     monclient.sub_unwant(log_watch);
     log_watch.clear();
     log_cb = NULL;
+    log_cb2 = NULL;
     log_cb_arg = NULL;
     return 0;
   }
@@ -951,15 +959,17 @@ int librados::RadosClient::monitor_log(const string& level, rados_log_callback_t
     return -EINVAL;
   }
 
-  if (log_cb)
+  if (log_cb || log_cb2)
     monclient.sub_unwant(log_watch);
 
   // (re)start watch
-  ldout(cct, 10) << __func__ << " add cb " << (void*)cb << " level " << level << dendl;
+  ldout(cct, 10) << __func__ << " add cb " << (void*)cb << " " << (void*)cb2
+		 << " level " << level << dendl;
   monclient.sub_want(watch_level, 0, 0);
 
   monclient.renew_subs();
   log_cb = cb;
+  log_cb2 = cb2;
   log_cb_arg = arg;
   log_watch = watch_level;
   return 0;
@@ -973,21 +983,29 @@ void librados::RadosClient::handle_log(MLog *m)
   if (log_last_version < m->version) {
     log_last_version = m->version;
 
-    if (log_cb) {
+    if (log_cb || log_cb2) {
       for (std::deque<LogEntry>::iterator it = m->entries.begin(); it != m->entries.end(); ++it) {
         LogEntry e = *it;
         ostringstream ss;
-        ss << e.stamp << " " << e.who.name << " " << e.prio << " " << e.msg;
+        ss << e.stamp << " " << e.name << " " << e.prio << " " << e.msg;
         string line = ss.str();
         string who = stringify(e.who);
+	string name = stringify(e.name);
         string level = stringify(e.prio);
         struct timespec stamp;
         e.stamp.to_timespec(&stamp);
 
         ldout(cct, 20) << __func__ << " delivering " << ss.str() << dendl;
-        log_cb(log_cb_arg, line.c_str(), who.c_str(),
-               stamp.tv_sec, stamp.tv_nsec,
-               e.seq, level.c_str(), e.msg.c_str());
+	if (log_cb)
+	  log_cb(log_cb_arg, line.c_str(), who.c_str(),
+		 stamp.tv_sec, stamp.tv_nsec,
+		 e.seq, level.c_str(), e.msg.c_str());
+	if (log_cb2)
+	  log_cb2(log_cb_arg, line.c_str(),
+		  e.channel.c_str(),
+		  who.c_str(), name.c_str(),
+		  stamp.tv_sec, stamp.tv_nsec,
+		  e.seq, level.c_str(), e.msg.c_str());
       }
     }
 

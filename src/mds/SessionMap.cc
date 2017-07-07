@@ -34,7 +34,7 @@ class SessionMapIOContext : public MDSIOContextBase
 {
   protected:
     SessionMap *sessionmap;
-    MDSRank *get_mds() {return sessionmap->mds;}
+    MDSRank *get_mds() override {return sessionmap->mds;}
   public:
     explicit SessionMapIOContext(SessionMap *sessionmap_) : sessionmap(sessionmap_) {
       assert(sessionmap != NULL);
@@ -90,12 +90,14 @@ public:
   int values_r;  //< Return value from OMAP value read
   bufferlist header_bl;
   std::map<std::string, bufferlist> session_vals;
+  bool more_session_vals = false;
 
   C_IO_SM_Load(SessionMap *cm, const bool f)
     : SessionMapIOContext(cm), first(f), header_r(0), values_r(0) {}
 
-  void finish(int r) {
-    sessionmap->_load_finish(r, header_r, values_r, first, header_bl, session_vals);
+  void finish(int r) override {
+    sessionmap->_load_finish(r, header_r, values_r, first, header_bl, session_vals,
+      more_session_vals);
   }
 };
 }
@@ -155,7 +157,8 @@ void SessionMap::_load_finish(
     int values_r,
     bool first,
     bufferlist &header_bl,
-    std::map<std::string, bufferlist> &session_vals)
+    std::map<std::string, bufferlist> &session_vals,
+    bool more_session_vals)
 {
   if (operation_r < 0) {
     derr << "_load_finish got " << cpp_strerror(operation_r) << dendl;
@@ -210,7 +213,7 @@ void SessionMap::_load_finish(
     ceph_abort();  // Should be unreachable because damaged() calls respawn()
   }
 
-  if (session_vals.size() == g_conf->mds_sessionmap_keys_per_op) {
+  if (more_session_vals) {
     // Issue another read if we're not at the end of the omap
     const std::string last_key = session_vals.rbegin()->first;
     dout(10) << __func__ << ": continue omap load from '"
@@ -220,7 +223,7 @@ void SessionMap::_load_finish(
     C_IO_SM_Load *c = new C_IO_SM_Load(this, false);
     ObjectOperation op;
     op.omap_get_vals(last_key, "", g_conf->mds_sessionmap_keys_per_op,
-        &c->session_vals, &c->values_r);
+		     &c->session_vals, &c->more_session_vals, &c->values_r);
     mds->objecter->read(oid, oloc, op, CEPH_NOSNAP, NULL, 0,
         new C_OnFinisher(c, mds->finisher));
   } else {
@@ -263,7 +266,7 @@ void SessionMap::load(MDSInternalContextBase *onload)
   ObjectOperation op;
   op.omap_get_header(&c->header_bl, &c->header_r);
   op.omap_get_vals("", "", g_conf->mds_sessionmap_keys_per_op,
-      &c->session_vals, &c->values_r);
+		   &c->session_vals, &c->more_session_vals, &c->values_r);
 
   mds->objecter->read(oid, oloc, op, CEPH_NOSNAP, NULL, 0, new C_OnFinisher(c, mds->finisher));
 }
@@ -273,7 +276,7 @@ class C_IO_SM_LoadLegacy : public SessionMapIOContext {
 public:
   bufferlist bl;
   explicit C_IO_SM_LoadLegacy(SessionMap *cm) : SessionMapIOContext(cm) {}
-  void finish(int r) {
+  void finish(int r) override {
     sessionmap->_load_legacy_finish(r, bl);
   }
 };
@@ -336,9 +339,12 @@ class C_IO_SM_Save : public SessionMapIOContext {
   version_t version;
 public:
   C_IO_SM_Save(SessionMap *cm, version_t v) : SessionMapIOContext(cm), version(v) {}
-  void finish(int r) {
-    assert(r == 0);
-    sessionmap->_save_finish(version);
+  void finish(int r) override {
+    if (r != 0) {
+      get_mds()->handle_write_error(r);
+    } else {
+      sessionmap->_save_finish(version);
+    }
   }
 };
 }
@@ -622,6 +628,9 @@ void SessionMap::touch_session(Session *session)
 
 void SessionMap::_mark_dirty(Session *s)
 {
+  if (dirty_sessions.count(s->info.inst.name))
+    return;
+
   if (dirty_sessions.size() >= g_conf->mds_sessionmap_keys_per_op) {
     // Pre-empt the usual save() call from journal segment trim, in
     // order to avoid building up an oversized OMAP update operation
@@ -629,6 +638,7 @@ void SessionMap::_mark_dirty(Session *s)
     save(new C_MDSInternalNoop, version);
   }
 
+  null_sessions.erase(s->info.inst.name);
   dirty_sessions.insert(s->info.inst.name);
 }
 
@@ -673,7 +683,7 @@ class C_IO_SM_Save_One : public SessionMapIOContext {
 public:
   C_IO_SM_Save_One(SessionMap *cm, MDSInternalContextBase *on_safe_)
     : SessionMapIOContext(cm), on_safe(on_safe_) {}
-  void finish(int r) {
+  void finish(int r) override {
     if (r != 0) {
       get_mds()->handle_write_error(r);
     } else {
@@ -1033,5 +1043,15 @@ bool SessionFilter::match(
   }
 
   return true;
+}
+
+std::ostream& operator<<(std::ostream &out, const Session &s)
+{
+ if (s.get_human_name() == stringify(s.info.inst.name.num())) {
+   out << s.get_human_name();
+ } else {
+   out << s.get_human_name() << " (" << std::dec << s.info.inst.name.num() << ")";
+ }
+ return out;
 }
 

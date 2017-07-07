@@ -33,6 +33,7 @@
 
 #include "include/cephfs/libcephfs.h"
 
+
 struct ceph_mount_info
 {
 public:
@@ -86,7 +87,7 @@ public:
 
     //at last the client
     ret = -CEPHFS_ERROR_NEW_CLIENT; //defined in libcephfs.h;
-    client = new Client(messenger, monclient);
+    client = new StandaloneClient(messenger, monclient);
     if (!client)
       goto fail;
 
@@ -248,7 +249,7 @@ public:
 private:
   bool mounted;
   bool inited;
-  Client *client;
+  StandaloneClient *client;
   MonClient *monclient;
   Messenger *messenger;
   CephContext *cct;
@@ -320,7 +321,6 @@ extern "C" int ceph_create_from_rados(struct ceph_mount_info **cmount,
 {
   auto rados = (librados::RadosClient *) cluster;
   auto cct = rados->cct;
-  cct->get();
   return ceph_create_with_context(cmount, cct);
 }
 
@@ -627,6 +627,17 @@ extern "C" int ceph_symlink(struct ceph_mount_info *cmount, const char *existing
   return cmount->get_client()->symlink(existing, newname, cmount->default_perms);
 }
 
+extern "C" int ceph_fstatx(struct ceph_mount_info *cmount, int fd, struct ceph_statx *stx,
+                            unsigned int want, unsigned int flags)
+{
+  if (!cmount->is_mounted())
+    return -ENOTCONN;
+  if (flags & ~CEPH_REQ_FLAG_MASK)
+    return -EINVAL;
+  return cmount->get_client()->fstatx(fd, stx, cmount->default_perms,
+                                      want, flags);
+}
+
 extern "C" int ceph_statx(struct ceph_mount_info *cmount, const char *path,
 			  struct ceph_statx *stx, unsigned int want, unsigned int flags)
 {
@@ -898,17 +909,6 @@ extern "C" int ceph_fallocate(struct ceph_mount_info *cmount, int fd, int mode,
   if (!cmount->is_mounted())
     return -ENOTCONN;
   return cmount->get_client()->fallocate(fd, mode, offset, length);
-}
-
-extern "C" int ceph_fstatx(struct ceph_mount_info *cmount, int fd, struct ceph_statx *stx,
-			    unsigned int want, unsigned int flags)
-{
-  if (!cmount->is_mounted())
-    return -ENOTCONN;
-  if (flags & ~CEPH_REQ_FLAG_MASK)
-    return -EINVAL;
-  return cmount->get_client()->fstatx(fd, stx, cmount->default_perms,
-				      want, flags);
 }
 
 extern "C" int ceph_sync_fs(struct ceph_mount_info *cmount)
@@ -1225,9 +1225,11 @@ extern "C" int ceph_get_osd_crush_location(struct ceph_mount_info *cmount,
     string& name = it->second;
     needed += type.size() + name.size() + 2;
     if (needed <= len) {
-      strcpy(path + cur, type.c_str());
+      if (path)
+	strcpy(path + cur, type.c_str());
       cur += type.size() + 1;
-      strcpy(path + cur, name.c_str());
+      if (path)
+	strcpy(path + cur, name.c_str());
       cur += name.size() + 1;
     }
   }
@@ -1434,7 +1436,7 @@ extern "C" int ceph_ll_forget(class ceph_mount_info *cmount, Inode *in,
   return (cmount->get_client()->ll_forget(in, count));
 }
 
-int ceph_ll_walk(struct ceph_mount_info *cmount, const char* name, Inode **i,
+extern "C" int ceph_ll_walk(struct ceph_mount_info *cmount, const char* name, Inode **i,
 		 struct ceph_statx *stx, unsigned int want, unsigned int flags,
 		 const UserPerm *perms)
 {

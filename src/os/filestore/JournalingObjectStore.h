@@ -19,6 +19,7 @@
 #include "Journal.h"
 #include "FileJournal.h"
 #include "common/RWLock.h"
+#include "osd/OpRequest.h"
 
 class JournalingObjectStore : public ObjectStore {
 protected:
@@ -139,7 +140,7 @@ public:
       apply_manager(cct, journal, finisher),
       replaying(false) {}
 
-  ~JournalingObjectStore() {
+  ~JournalingObjectStore() override {
   }
 };
 

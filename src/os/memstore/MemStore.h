@@ -96,10 +96,11 @@ public:
   struct PageSetObject;
   struct Collection : public CollectionImpl {
     coll_t cid;
+    int bits;
     CephContext *cct;
     bool use_page_set;
     ceph::unordered_map<ghobject_t, ObjectRef> object_hash;  ///< for lookup
-    map<ghobject_t, ObjectRef,ghobject_t::BitwiseComparator> object_map;        ///< for iteration
+    map<ghobject_t, ObjectRef> object_map;        ///< for iteration
     map<string,bufferptr> xattr;
     RWLock lock;   ///< for object_{map,hash}
     bool exists;
@@ -141,7 +142,7 @@ public:
       ::encode(use_page_set, bl);
       uint32_t s = object_map.size();
       ::encode(s, bl);
-      for (map<ghobject_t, ObjectRef,ghobject_t::BitwiseComparator>::const_iterator p = object_map.begin();
+      for (map<ghobject_t, ObjectRef>::const_iterator p = object_map.begin();
 	   p != object_map.end();
 	   ++p) {
 	::encode(p->first, bl);
@@ -168,7 +169,7 @@ public:
 
     uint64_t used_bytes() const {
       uint64_t result = 0;
-      for (map<ghobject_t, ObjectRef,ghobject_t::BitwiseComparator>::const_iterator p = object_map.begin();
+      for (map<ghobject_t, ObjectRef>::const_iterator p = object_map.begin();
 	   p != object_map.end();
 	   ++p) {
         result += p->second->get_size();
@@ -223,7 +224,7 @@ private:
 
   int _collection_hint_expected_num_objs(const coll_t& cid, uint32_t pg_num,
       uint64_t num_objs) const { return 0; }
-  int _create_collection(const coll_t& c);
+  int _create_collection(const coll_t& c, int bits);
   int _destroy_collection(const coll_t& c);
   int _collection_add(const coll_t& cid, const coll_t& ocid, const ghobject_t& oid);
   int _collection_move_rename(const coll_t& oldcid, const ghobject_t& oldoid,
@@ -242,7 +243,7 @@ public:
       coll_lock("MemStore::coll_lock"),
       finisher(cct),
       used_bytes(0) {}
-  ~MemStore() { }
+  ~MemStore() override { }
 
   string get_type() override {
     return "memstore";
@@ -254,6 +255,10 @@ public:
 
   int mount() override;
   int umount() override;
+
+  int fsck(bool deep) override {
+    return 0;
+  }
 
   int validate_hobject_key(const hobject_t &obj) const override {
     return 0;
@@ -286,25 +291,24 @@ public:
 	   struct stat *st, bool allow_eio = false) override;
   int set_collection_opts(
     const coll_t& cid,
-    const pool_opts_t& opts);
+    const pool_opts_t& opts) override;
   int read(
     const coll_t& cid,
     const ghobject_t& oid,
     uint64_t offset,
     size_t len,
     bufferlist& bl,
-    uint32_t op_flags = 0,
-    bool allow_eio = false) override;
+    uint32_t op_flags = 0) override;
   int read(
     CollectionHandle &c,
     const ghobject_t& oid,
     uint64_t offset,
     size_t len,
     bufferlist& bl,
-    uint32_t op_flags = 0,
-    bool allow_eio = false) override;
+    uint32_t op_flags = 0) override;
   using ObjectStore::fiemap;
   int fiemap(const coll_t& cid, const ghobject_t& oid, uint64_t offset, size_t len, bufferlist& bl) override;
+  int fiemap(const coll_t& cid, const ghobject_t& oid, uint64_t offset, size_t len, map<uint64_t, uint64_t>& destmap) override;
   int getattr(const coll_t& cid, const ghobject_t& oid, const char *name,
 	      bufferptr& value) override;
   int getattr(CollectionHandle &c, const ghobject_t& oid, const char *name,
@@ -321,10 +325,10 @@ public:
   }
   bool collection_exists(const coll_t& c) override;
   int collection_empty(const coll_t& c, bool *empty) override;
+  int collection_bits(const coll_t& c) override;
   using ObjectStore::collection_list;
   int collection_list(const coll_t& cid,
-		      const ghobject_t& start, const ghobject_t& end,
-		      bool sort_bitwise, int max,
+		      const ghobject_t& start, const ghobject_t& end, int max,
 		      vector<ghobject_t> *ls, ghobject_t *next) override;
 
   using ObjectStore::omap_get;
@@ -384,6 +388,11 @@ public:
   }
 
   objectstore_perf_stat_t get_cur_stats() override;
+
+  const PerfCounters* get_perf_counters() const override {
+    return nullptr;
+  }
+
 
   int queue_transactions(
     Sequencer *osr, vector<Transaction>& tls,

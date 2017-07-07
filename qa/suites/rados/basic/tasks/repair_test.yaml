@@ -1,5 +1,6 @@
 overrides:
   ceph:
+    wait-for-scrub: false
     log-whitelist:
       - candidate had a stat error
       - candidate had a read error
@@ -21,7 +22,5 @@ overrides:
         filestore debug inject read err: true
         bluestore debug inject read err: true
 tasks:
-- install:
-- ceph:
 - repair_test:
 

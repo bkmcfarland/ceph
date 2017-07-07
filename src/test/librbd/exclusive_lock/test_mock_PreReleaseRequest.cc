@@ -1,4 +1,4 @@
-// -*- mode:C; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
 // vim: ts=8 sw=2 smarttab
 
 #include "test/librbd/test_mock_fixture.h"
@@ -7,6 +7,7 @@
 #include "test/librbd/mock/MockJournal.h"
 #include "test/librbd/mock/MockObjectMap.h"
 #include "test/librados_test_stub/MockTestMemIoCtxImpl.h"
+#include "common/AsyncOpTracker.h"
 #include "librbd/exclusive_lock/PreReleaseRequest.h"
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
@@ -17,8 +18,6 @@
 template class librbd::exclusive_lock::PreReleaseRequest<librbd::MockImageCtx>;
 
 namespace librbd {
-
-using librbd::ManagedLock;
 
 namespace exclusive_lock {
 
@@ -54,22 +53,28 @@ public:
                   .WillOnce(Return(enabled));
   }
 
-  void expect_set_require_lock_on_read(MockImageCtx &mock_image_ctx) {
-    EXPECT_CALL(*mock_image_ctx.aio_work_queue, set_require_lock_on_read());
+  void expect_set_require_lock(MockImageCtx &mock_image_ctx,
+                               librbd::io::Direction direction, bool enabled) {
+    EXPECT_CALL(*mock_image_ctx.io_work_queue, set_require_lock(direction,
+                                                                enabled));
   }
 
   void expect_block_writes(MockImageCtx &mock_image_ctx, int r) {
     expect_test_features(mock_image_ctx, RBD_FEATURE_JOURNALING,
                          ((mock_image_ctx.features & RBD_FEATURE_JOURNALING) != 0));
-    if ((mock_image_ctx.features & RBD_FEATURE_JOURNALING) != 0) {
-      expect_set_require_lock_on_read(mock_image_ctx);
+    if (mock_image_ctx.clone_copy_on_read ||
+        (mock_image_ctx.features & RBD_FEATURE_JOURNALING) != 0) {
+      expect_set_require_lock(mock_image_ctx, librbd::io::DIRECTION_BOTH, true);
+    } else {
+      expect_set_require_lock(mock_image_ctx, librbd::io::DIRECTION_WRITE,
+                              true);
     }
-    EXPECT_CALL(*mock_image_ctx.aio_work_queue, block_writes(_))
+    EXPECT_CALL(*mock_image_ctx.io_work_queue, block_writes(_))
                   .WillOnce(CompleteContext(r, mock_image_ctx.image_ctx->op_work_queue));
   }
 
   void expect_unblock_writes(MockImageCtx &mock_image_ctx) {
-    EXPECT_CALL(*mock_image_ctx.aio_work_queue, unblock_writes());
+    EXPECT_CALL(*mock_image_ctx.io_work_queue, unblock_writes());
   }
 
   void expect_cancel_op_requests(MockImageCtx &mock_image_ctx, int r) {
@@ -93,7 +98,7 @@ public:
                                int r) {
     if (mock_image_ctx.object_cacher != nullptr) {
       EXPECT_CALL(mock_image_ctx, invalidate_cache(purge, _))
-                    .WillOnce(WithArg<1>(CompleteContext(r, NULL)));
+                    .WillOnce(WithArg<1>(CompleteContext(r, static_cast<ContextWQ*>(NULL)))); 
     }
   }
 
@@ -120,6 +125,7 @@ public:
     EXPECT_CALL(*mock_image_ctx.state, handle_prepare_lock_complete());
   }
 
+  AsyncOpTracker m_async_op_tracker;
 };
 
 TEST_F(TestMockExclusiveLockPreReleaseRequest, Success) {
@@ -147,13 +153,11 @@ TEST_F(TestMockExclusiveLockPreReleaseRequest, Success) {
   mock_image_ctx.object_map = mock_object_map;
   expect_close_object_map(mock_image_ctx, *mock_object_map);
 
-  MockContext mock_releasing_ctx;
-  expect_complete_context(mock_releasing_ctx, 0);
   expect_handle_prepare_lock_complete(mock_image_ctx);
 
   C_SaferCond ctx;
   MockPreReleaseRequest *req = MockPreReleaseRequest::create(
-    mock_image_ctx, &mock_releasing_ctx, &ctx, false);
+    mock_image_ctx, false, m_async_op_tracker, &ctx);
   req->send();
   ASSERT_EQ(0, ctx.wait());
 }
@@ -181,12 +185,10 @@ TEST_F(TestMockExclusiveLockPreReleaseRequest, SuccessJournalDisabled) {
 
   expect_handle_prepare_lock_complete(mock_image_ctx);
 
-  C_SaferCond release_ctx;
   C_SaferCond ctx;
   MockPreReleaseRequest *req = MockPreReleaseRequest::create(
-    mock_image_ctx, &release_ctx, &ctx, false);
+    mock_image_ctx, false, m_async_op_tracker, &ctx);
   req->send();
-  ASSERT_EQ(0, release_ctx.wait());
   ASSERT_EQ(0, ctx.wait());
 }
 
@@ -209,9 +211,8 @@ TEST_F(TestMockExclusiveLockPreReleaseRequest, SuccessObjectMapDisabled) {
   C_SaferCond release_ctx;
   C_SaferCond ctx;
   MockPreReleaseRequest *req = MockPreReleaseRequest::create(
-    mock_image_ctx, &release_ctx, &ctx, true);
+    mock_image_ctx, true, m_async_op_tracker, &ctx);
   req->send();
-  ASSERT_EQ(0, release_ctx.wait());
   ASSERT_EQ(0, ctx.wait());
 }
 
@@ -242,13 +243,11 @@ TEST_F(TestMockExclusiveLockPreReleaseRequest, Blacklisted) {
   mock_image_ctx.object_map = mock_object_map;
   expect_close_object_map(mock_image_ctx, *mock_object_map);
 
-  MockContext mock_releasing_ctx;
-  expect_complete_context(mock_releasing_ctx, 0);
   expect_handle_prepare_lock_complete(mock_image_ctx);
 
   C_SaferCond ctx;
   MockPreReleaseRequest *req = MockPreReleaseRequest::create(
-    mock_image_ctx, &mock_releasing_ctx, &ctx, false);
+    mock_image_ctx, false, m_async_op_tracker, &ctx);
   req->send();
   ASSERT_EQ(0, ctx.wait());
 }
@@ -270,7 +269,7 @@ TEST_F(TestMockExclusiveLockPreReleaseRequest, BlockWritesError) {
 
   C_SaferCond ctx;
   MockPreReleaseRequest *req = MockPreReleaseRequest::create(
-    mock_image_ctx, nullptr, &ctx, true);
+    mock_image_ctx, true, m_async_op_tracker, &ctx);
   req->send();
   ASSERT_EQ(-EINVAL, ctx.wait());
 }
@@ -293,7 +292,7 @@ TEST_F(TestMockExclusiveLockPreReleaseRequest, UnlockError) {
 
   C_SaferCond ctx;
   MockPreReleaseRequest *req = MockPreReleaseRequest::create(
-    mock_image_ctx, nullptr, &ctx, true);
+    mock_image_ctx, true, m_async_op_tracker, &ctx);
   req->send();
   ASSERT_EQ(0, ctx.wait());
 }

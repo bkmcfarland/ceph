@@ -26,9 +26,10 @@ using namespace std;
 #include "include/unordered_set.h"
 
 #include "common/Mutex.h"
-#include "include/atomic.h"
 #include "common/Cond.h"
 #include "common/Thread.h"
+
+#include "include/Spinlock.h"
 
 #include "msg/SimplePolicyMessenger.h"
 #include "msg/DispatchQueue.h"
@@ -82,25 +83,25 @@ public:
    * _nonce A unique ID to use for this AsyncMessenger. It should not
    * be a value that will be repeated if the daemon restarts.
    */
-  AsyncMessenger(CephContext *cct, entity_name_t name,
+  AsyncMessenger(CephContext *cct, entity_name_t name, const std::string &type,
                  string mname, uint64_t _nonce);
 
   /**
    * Destroy the AsyncMessenger. Pretty simple since all the work is done
    * elsewhere.
    */
-  virtual ~AsyncMessenger();
+  ~AsyncMessenger() override;
 
   /** @defgroup Accessors
    * @{
    */
   void set_addr_unknowns(const entity_addr_t &addr) override;
 
-  int get_dispatch_queue_len() {
+  int get_dispatch_queue_len() override {
     return dispatch_queue.get_queue_len();
   }
 
-  double get_dispatch_queue_max_age(utime_t now) {
+  double get_dispatch_queue_max_age(utime_t now) override {
     return dispatch_queue.get_max_age(now);
   }
   /** @} Accessors */
@@ -109,13 +110,14 @@ public:
    * @defgroup Configuration functions
    * @{
    */
-  void set_cluster_protocol(int p) {
+  void set_cluster_protocol(int p) override {
     assert(!started && !did_bind);
     cluster_protocol = p;
   }
 
-  int bind(const entity_addr_t& bind_addr);
-  int rebind(const set<int>& avoid_ports);
+  int bind(const entity_addr_t& bind_addr) override;
+  int rebind(const set<int>& avoid_ports) override;
+  int client_bind(const entity_addr_t& bind_addr) override;
 
   /** @} Configuration functions */
 
@@ -147,9 +149,8 @@ public:
    */
   ConnectionRef get_connection(const entity_inst_t& dest) override;
   ConnectionRef get_loopback_connection() override;
-  int send_keepalive(Connection *con);
-  virtual void mark_down(const entity_addr_t& addr) override;
-  virtual void mark_down_all() override {
+  void mark_down(const entity_addr_t& addr) override;
+  void mark_down_all() override {
     shutdown_connections(true);
   }
   /** @} // Connection Management */
@@ -224,6 +225,8 @@ private:
   // the worker run messenger's cron jobs
   Worker *local_worker;
 
+  std::string ms_type;
+
   /// overall lock used for AsyncMessenger data structures
   Mutex lock;
   // AsyncMessenger stuff
@@ -233,6 +236,17 @@ private:
   /// true, specifying we haven't learned our addr; set false when we find it.
   // maybe this should be protected by the lock?
   bool need_addr;
+
+  /**
+   * set to bind address if bind was called before NetworkStack was ready to
+   * bind
+   */
+  entity_addr_t pending_bind_addr;
+
+  /**
+   * false; set to true if a pending bind exists
+   */
+  bool pending_bind = false;
 
   /**
    *  The following aren't lock-protected since you shouldn't be able to race
@@ -340,6 +354,8 @@ public:
       // If conn already in, we will return 0
       Mutex::Locker l(deleted_lock);
       if (deleted_conns.erase(existing)) {
+        existing->get_perf_counter()->dec(l_msgr_active_connections);
+        conns.erase(it);
       } else if (conn != existing) {
         return -1;
       }

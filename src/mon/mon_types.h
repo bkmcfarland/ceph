@@ -15,12 +15,13 @@
 #ifndef CEPH_MON_TYPES_H
 #define CEPH_MON_TYPES_H
 
+#include <map>
+
 #include "include/utime.h"
 #include "include/util.h"
 #include "common/Formatter.h"
 #include "common/bit_str.h"
 #include "include/Context.h"
-#include "mon/MonOpRequest.h"
 
 #define PAXOS_PGMAP      0  // before osd, for pg kick to behave
 #define PAXOS_MDSMAP     1
@@ -29,7 +30,8 @@
 #define PAXOS_MONMAP     4
 #define PAXOS_AUTH       5
 #define PAXOS_MGR        6
-#define PAXOS_NUM        7
+#define PAXOS_MGRSTAT    7
+#define PAXOS_NUM        8
 
 inline const char *get_paxos_name(int p) {
   switch (p) {
@@ -40,11 +42,72 @@ inline const char *get_paxos_name(int p) {
   case PAXOS_LOG: return "logm";
   case PAXOS_AUTH: return "auth";
   case PAXOS_MGR: return "mgr";
+  case PAXOS_MGRSTAT: return "mgrstat";
   default: ceph_abort(); return 0;
   }
 }
 
 #define CEPH_MON_ONDISK_MAGIC "ceph mon volume v012"
+
+// map of entity_type -> features -> count
+struct FeatureMap {
+  std::map<uint32_t,std::map<uint64_t,uint64_t>> m;
+
+  void add(uint32_t type, uint64_t features) {
+    m[type][features]++;
+  }
+
+  void rm(uint32_t type, uint64_t features) {
+    auto p = m.find(type);
+    assert(p != m.end());
+    auto q = p->second.find(features);
+    assert(q != p->second.end());
+    if (--q->second == 0) {
+      p->second.erase(q);
+      if (p->second.empty()) {
+	m.erase(p);
+      }
+    }
+  }
+
+  FeatureMap& operator+=(const FeatureMap& o) {
+    for (auto& p : o.m) {
+      auto &v = m[p.first];
+      for (auto& q : p.second) {
+	v[q.first] += q.second;
+      }
+    }
+    return *this;
+  }
+
+  void encode(bufferlist& bl) const {
+    ENCODE_START(1, 1, bl);
+    ::encode(m, bl);
+    ENCODE_FINISH(bl);
+  }
+
+  void decode(bufferlist::iterator& p) {
+    DECODE_START(1, p);
+    ::decode(m, p);
+    DECODE_FINISH(p);
+  }
+
+  void dump(Formatter *f) const {
+    for (auto& p : m) {
+      f->open_object_section(ceph_entity_type_name(p.first));
+      for (auto& q : p.second) {
+	f->open_object_section("group");
+	f->dump_unsigned("features", q.first);
+	f->dump_string("release", ceph_release_name(
+			 ceph_release_from_features(q.first)));
+	f->dump_unsigned("num", q.second);
+	f->close_section();
+      }
+      f->close_section();
+    }
+  }
+};
+WRITE_CLASS_ENCODER(FeatureMap)
 
 /**
  * leveldb store stats
@@ -210,32 +273,6 @@ static inline ostream& operator<<(ostream& out, const ScrubResult& r) {
 
 /// for information like os, kernel, hostname, memory info, cpu model.
 typedef map<string, string> Metadata;
-
-struct C_MonOp : public Context
-{
-  MonOpRequestRef op;
-
-  explicit C_MonOp(MonOpRequestRef o) :
-    op(o) { }
-
-  void finish(int r) {
-    if (op && r == -ECANCELED) {
-      op->mark_event("callback canceled");
-    } else if (op && r == -EAGAIN) {
-      op->mark_event("callback retry");
-    } else if (op && r == 0) {
-      op->mark_event("callback finished");
-    }
-    _finish(r);
-  }
-
-  void mark_op_event(const string &event) {
-    if (op)
-      op->mark_event(event);
-  }
-
-  virtual void _finish(int r) = 0;
-};
 
 namespace ceph {
   namespace features {
@@ -437,7 +474,9 @@ WRITE_CLASS_ENCODER(mon_feature_t)
 namespace ceph {
   namespace features {
     namespace mon {
-      constexpr mon_feature_t FEATURE_KRAKEN(      (1ULL << 0));
+      constexpr mon_feature_t FEATURE_KRAKEN(     (1ULL << 0));
+      constexpr mon_feature_t FEATURE_LUMINOUS(   (1ULL << 1));
+
       constexpr mon_feature_t FEATURE_RESERVED(   (1ULL << 63));
       constexpr mon_feature_t FEATURE_NONE(       (0ULL));
 
@@ -448,9 +487,10 @@ namespace ceph {
        */
       constexpr mon_feature_t get_supported() {
         return (
-            FEATURE_KRAKEN |
-            FEATURE_NONE
-            );
+	  FEATURE_KRAKEN |
+	  FEATURE_LUMINOUS |
+	  FEATURE_NONE
+	  );
       }
       /**
        * All the features that, once set, cannot be removed.
@@ -464,9 +504,10 @@ namespace ceph {
        */
       constexpr mon_feature_t get_persistent() {
         return (
-            FEATURE_KRAKEN |
-            FEATURE_NONE
-            );
+	  FEATURE_KRAKEN |
+	  FEATURE_LUMINOUS |
+	  FEATURE_NONE
+	  );
       }
 
       static inline mon_feature_t get_feature_by_name(std::string n);
@@ -479,6 +520,8 @@ static inline const char *ceph::features::mon::get_feature_name(uint64_t b) {
 
   if (f == FEATURE_KRAKEN) {
     return "kraken";
+  } else if (f == FEATURE_LUMINOUS) {
+    return "luminous";
   } else if (f == FEATURE_RESERVED) {
     return "reserved";
   }
@@ -490,6 +533,8 @@ mon_feature_t ceph::features::mon::get_feature_by_name(std::string n) {
 
   if (n == "kraken") {
     return FEATURE_KRAKEN;
+  } else if (n == "luminous") {
+    return FEATURE_LUMINOUS;
   } else if (n == "reserved") {
     return FEATURE_RESERVED;
   }

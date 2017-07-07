@@ -57,13 +57,13 @@ private:
   uint64_t instance_id;
 
   bool _dispatch(Message *m);
-  bool ms_dispatch(Message *m);
+  bool ms_dispatch(Message *m) override;
 
-  bool ms_get_authorizer(int dest_type, AuthAuthorizer **authorizer, bool force_new);
-  void ms_handle_connect(Connection *con);
-  bool ms_handle_reset(Connection *con);
-  void ms_handle_remote_reset(Connection *con);
-  bool ms_handle_refused(Connection *con);
+  bool ms_get_authorizer(int dest_type, AuthAuthorizer **authorizer, bool force_new) override;
+  void ms_handle_connect(Connection *con) override;
+  bool ms_handle_reset(Connection *con) override;
+  void ms_handle_remote_reset(Connection *con) override;
+  bool ms_handle_refused(Connection *con) override;
 
   Objecter *objecter;
 
@@ -74,6 +74,7 @@ private:
 
   version_t log_last_version;
   rados_log_callback_t log_cb;
+  rados_log_callback2_t log_cb2;
   void *log_cb_arg;
   string log_watch;
 
@@ -83,7 +84,7 @@ public:
   Finisher finisher;
 
   explicit RadosClient(CephContext *cct_);
-  ~RadosClient();
+  ~RadosClient() override;
   int ping_monitor(string mon_id, string *result);
   int connect();
   void shutdown();
@@ -144,7 +145,8 @@ public:
 	         bufferlist *poutbl, string *prs);
 
   void handle_log(MLog *m);
-  int monitor_log(const string& level, rados_log_callback_t cb, void *arg);
+  int monitor_log(const string& level, rados_log_callback_t cb,
+		  rados_log_callback2_t cb2, void *arg);
 
   void get();
   bool put();
